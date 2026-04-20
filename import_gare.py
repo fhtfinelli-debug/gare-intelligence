@@ -217,7 +217,7 @@ def import_ted():
     gare  = []
     pagina = 1
     totale = 0
-    max_pagine = 100  # max 1000 notice per run
+    max_pagine = 1000  # max 10000 notice per run
 
     while pagina <= max_pagine:
         try:
@@ -239,58 +239,82 @@ def import_ted():
                 print(f"  📡 TED: {totale} notice totali, scarico fino a {max_pagine*10}")
 
             for n in notices:
-                # Scadenza — array
+                # Scadenza
                 scad_list = n.get("deadline-receipt-request") or []
                 scad = scad_list[0] if scad_list else ""
-                if scad and "+" not in scad and not scad.endswith("Z"): scad += "+00:00"
+                if scad and "+" not in scad and not scad.endswith("Z"):
+                    scad += "+00:00"
 
                 # Salta se scaduta
                 scad_date = parse_scad_date(scad[:10] if scad else "")
                 if scad_date:
                     diff = (scad_date - date.today()).days
-                    if diff < 0:    continue
-                    elif diff <= 7: stato_ted = "in_scadenza"
-                    else:           stato_ted = "attiva"
+                    if diff < 0:
+                        continue
+                    elif diff <= 7:
+                        stato_ted = "in_scadenza"
+                    else:
+                        stato_ted = "attiva"
                 else:
                     stato_ted = "attiva"
 
-                # Titolo — dizionario multilingua
+                # Titolo
                 titolo_dict = n.get("notice-title") or {}
                 titolo = titolo_dict.get("ita") or titolo_dict.get("eng") or ""
-                if isinstance(titolo, list): titolo = titolo[0] if titolo else ""
+                if isinstance(titolo, list):
+                    titolo = titolo[0] if titolo else ""
 
-                # Ente — dizionario multilingua
+                # Ente
                 ente_dict = n.get("buyer-name") or {}
                 ente = ente_dict.get("ita") or ente_dict.get("eng") or ""
-                if isinstance(ente, list): ente = ente[0] if ente else ""
+                if isinstance(ente, list):
+                    ente = ente[0] if ente else ""
 
                 # CPV
                 cpv_list = n.get("classification-cpv") or []
                 cpv = cpv_list[0] if cpv_list else ""
 
+                # Publication number
                 pub_num = (n.get("publication-number") or "").strip()
 
-                # URL bando e PDF italiano
-                links     = n.get("links") or {}
-                html_link = (links.get("html") or {}).get("ITA") or                             f"https://ted.europa.eu/it/notice/-/detail/{pub_num}"
-                pdf_link  = (links.get("pdf") or {}).get("ITA") or None
+                # URL bando (HTML italiano) e PDF
+                links = n.get("links") or {}
+                html_links = links.get("html") or {}
+                pdf_links  = links.get("pdf") or {}
+                url_bando   = html_links.get("ITA") or f"https://ted.europa.eu/it/notice/-/detail/{pub_num}"
+                url_portale = pdf_links.get("ITA") or None
 
-                pop       = n.get("place-of-performance") or []
+                # Luogo
+                pop = n.get("place-of-performance") or []
                 provincia = pop[0] if pop else None
 
                 gare.append({
-                    "codice_cig":None,
-                    "titolo":titolo[:500] if titolo else "(n/d)",
-                    "descrizione":None,"riassunto_ai":None,"keywords_ai":[],"settore_ai":None,
-                    "ente":ente or None,
-                    "regione":"ITALIA","provincia":provincia,"comune":None,
-                    "categoria_cpv":cpv[:20] if cpv else None,"categoria_label":None,
-                    "procedura":"Procedura aperta (EU)","criterio_aggiudicazione":None,
-                    "importo_min":None,"importo_max":None,"importo_totale":None,
-                    "scadenza":scad or None,"data_pubblicazione":oggi,
-                    "stato":stato_ted,"fonte":"TED_EU",
-                    "url_bando":html_link,
-                    "url_portale":pdf_link,"id_sintel":None,"codice_gara":pub_num or None,"rup":None,
+                    "codice_cig":   None,
+                    "titolo":       titolo[:500] if titolo else "(n/d)",
+                    "descrizione":  None,
+                    "riassunto_ai": None,
+                    "keywords_ai":  [],
+                    "settore_ai":   None,
+                    "ente":         ente or None,
+                    "regione":      "ITALIA",
+                    "provincia":    provincia,
+                    "comune":       None,
+                    "categoria_cpv":   cpv[:20] if cpv else None,
+                    "categoria_label": None,
+                    "procedura":    "Procedura aperta (EU)",
+                    "criterio_aggiudicazione": None,
+                    "importo_min":  None,
+                    "importo_max":  None,
+                    "importo_totale": None,
+                    "scadenza":     scad or None,
+                    "data_pubblicazione": oggi,
+                    "stato":        stato_ted,
+                    "fonte":        "TED_EU",
+                    "url_bando":    url_bando,
+                    "url_portale":  url_portale,
+                    "id_sintel":    None,
+                    "codice_gara":  pub_num or None,
+                    "rup":          None,
                 })
 
             pagina += 1
