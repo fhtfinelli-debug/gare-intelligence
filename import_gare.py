@@ -31,7 +31,7 @@ KEYWORDS   = [
     "antincendio","energy service","efficienza energetica",
     "verde pubblico","sfalcio","vigilanza","portierato","ascensori","elevatori",
 ]
-IMPORTO_MIN = 40_000
+IMPORTO_MIN = 1_000
 BATCH_SIZE  = 50
 
 def cpv_ok(cpv):  return any((cpv or "")[:4].startswith(p) for p in CPV_TARGET)
