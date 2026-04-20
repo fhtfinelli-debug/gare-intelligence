@@ -214,22 +214,33 @@ def import_anac_monthly():
 def import_ted():
     print("🇪🇺 TED EU")
     r = requests.post(f"{WORKER_URL}/ted", json={}, timeout=60)
-    print(f"  HTTP {r.status_code}: {r.text[:150]}")
+    print(f"  HTTP {r.status_code}: {r.text[:100]}")
     try:
         data    = r.json()
-        notices = data.get("notices", data.get("results", []))
+        notices = data.get("notices", [])
     except Exception as e:
         return {"fonte":"TED_EU","inserite":0,"errore":str(e)}
 
-    print(f"  📡 {len(notices)} notices")
+    print(f"  📡 {len(notices)} notices (totale: {data.get('totalNoticeCount',0)})")
     oggi = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     gare = []
     for n in notices:
-        cpv    = n.get("cpv-code","")
-        titolo = n.get("title","")
+        # CPV — array di stringhe
+        cpv_list = n.get("classification-cpv") or []
+        cpv = cpv_list[0] if cpv_list else ""
+
+        # Titolo — dizionario multilingua
+        titolo_dict = n.get("notice-title") or {}
+        titolo = titolo_dict.get("ita") or titolo_dict.get("eng") or ""
+        if isinstance(titolo, list): titolo = titolo[0] if titolo else ""
+
         if not cpv_ok(cpv) and not kw_ok(titolo): continue
-        scad = n.get("deadline-receipt-request") or ""
+
+        # Scadenza — array
+        scad_list = n.get("deadline-receipt-request") or []
+        scad = scad_list[0] if scad_list else ""
         if scad and "+" not in scad and not scad.endswith("Z"): scad += "+00:00"
+
         scad_date = parse_scad_date(scad[:10] if scad else "")
         if scad_date:
             diff = (scad_date - date.today()).days
@@ -238,27 +249,41 @@ def import_ted():
             else:           stato_ted = "attiva"
         else:
             stato_ted = "attiva"
-        importo = (n.get("estimated-value") or {}).get("amount",0)
+
+        # Ente — dizionario multilingua
+        ente_dict = n.get("buyer-name") or {}
+        ente = ente_dict.get("ita") or ente_dict.get("eng") or ""
+        if isinstance(ente, list): ente = ente[0] if ente else ""
+
         pub_num = (n.get("publication-number") or "").strip()
-        pub_url = pub_num.replace("/","-").replace(" ","-")
+
+        # URL bando — link italiano diretto dalla risposta TED
+        links     = n.get("links") or {}
+        html_link = (links.get("html") or {}).get("ITA") or                     f"https://ted.europa.eu/it/notice/-/detail/{pub_num}"
+
+        pop      = n.get("place-of-performance") or []
+        provincia = pop[0] if pop else None
+
         gare.append({
-            "codice_cig":None,"titolo":(titolo or "(n/d)")[:500],
+            "codice_cig":None,
+            "titolo":titolo[:500] if titolo else "(n/d)",
             "descrizione":None,"riassunto_ai":None,"keywords_ai":[],"settore_ai":None,
-            "ente":n.get("contracting-authority-name") or None,
-            "regione":"ITALIA","provincia":n.get("place-of-performance") or None,"comune":None,
+            "ente":ente or None,
+            "regione":"ITALIA","provincia":provincia,"comune":None,
             "categoria_cpv":cpv[:20] if cpv else None,"categoria_label":None,
             "procedura":"Procedura aperta (EU)","criterio_aggiudicazione":None,
-            "importo_min":None,"importo_max":None,
-            "importo_totale":float(importo) if importo else None,
+            "importo_min":None,"importo_max":None,"importo_totale":None,
             "scadenza":scad or None,"data_pubblicazione":oggi,
             "stato":stato_ted,"fonte":"TED_EU",
-            "url_bando":f"https://ted.europa.eu/en/notice/-/detail/{pub_url}",
+            "url_bando":html_link,
             "url_portale":None,"id_sintel":None,"codice_gara":pub_num or None,"rup":None,
         })
-    print(f"  📊 {len(gare)} attive/in_scadenza")
+
+    print(f"  📊 {len(gare)} attive/in_scadenza filtrate")
     inserite = insert_batch(gare)
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"TED_EU","notices":len(notices),"filtrate":len(gare),"inserite":inserite}
+
 
 if __name__ == "__main__":
     print(f"🚀 Gare Intelligence [{MODE.upper()}] — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
