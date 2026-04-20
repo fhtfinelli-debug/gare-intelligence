@@ -132,7 +132,7 @@ def riga_to_gara(r):
         "stato":        stato,
         "fonte":        "ANAC",
         "url_bando":    f"https://api.anticorruzione.it/apicig/1.0.0/getSmartCig/{cig}",
-        "url_portale":  "https://dati.anticorruzione.it",
+        "url_portale":  None,
         "id_sintel":    None,
         "codice_gara":  r.get("numero_gara") or None,
         "rup":          None,
@@ -239,7 +239,7 @@ def import_ted():
             "scadenza":scad or None,"data_pubblicazione":oggi,
             "stato":stato_ted,"fonte":"TED_EU",
             "url_bando":f"https://ted.europa.eu/en/notice/-/detail/{pub_url}",
-            "url_portale":"https://ted.europa.eu",
+            "url_portale":None,
             "id_sintel":None,"codice_gara":pub_num or None,"rup":None,
         })
 
