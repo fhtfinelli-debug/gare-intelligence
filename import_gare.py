@@ -217,7 +217,7 @@ def import_ted():
     gare  = []
     pagina = 1
     totale = 0
-    max_pagine = 30  # max 300 notice per run (aumentabile)
+    max_pagine = 100  # max 1000 notice per run
 
     while pagina <= max_pagine:
         try:
@@ -289,7 +289,7 @@ def import_ted():
                     "scadenza":scad or None,"data_pubblicazione":oggi,
                     "stato":stato_ted,"fonte":"TED_EU",
                     "url_bando":html_link,
-                    "url_portale":None,"id_sintel":None,"codice_gara":pub_num or None,"rup":None,
+                    "url_portale":pdf_link,"id_sintel":None,"codice_gara":pub_num or None,"rup":None,
                 })
 
             pagina += 1
