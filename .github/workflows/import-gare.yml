@@ -37,8 +37,6 @@ jobs:
       - name: Determina modalità
         id: mode
         run: |
-          # Se avviato manualmente usa il parametro scelto
-          # Se è il 2 del mese usa monthly, altrimenti daily
           if [ "${{ github.event.inputs.mode }}" != "" ]; then
             echo "MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
           elif [ "$(date +%d)" = "02" ]; then
@@ -52,5 +50,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
+          ARIA_CLIENT_ID: ${{ secrets.ARIA_CLIENT_ID }}
+          ARIA_CLIENT_SECRET: ${{ secrets.ARIA_CLIENT_SECRET }}
           MODE: ${{ env.MODE }}
         run: python import_gare.py
