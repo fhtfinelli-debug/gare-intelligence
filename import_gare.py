@@ -1,5 +1,5 @@
 """
-import_gare.py — Solo gare ATTIVE e IN_SCADENZA + fix batch duplicati
+import_gare.py — Solo ATTIVE/IN_SCADENZA + URL documenti corretti
 """
 import os, io, csv, json, zipfile, requests
 from datetime import datetime, date
@@ -66,10 +66,9 @@ def mappa_stato(stato_anac, scadenza_raw):
     if stato in ("ANNULLATO","CANCELLATO"):
         return None
     scad = parse_scad_date(scadenza_raw)
-    if not scad:
-        return "attiva"
+    if not scad: return "attiva"
     diff = (scad - date.today()).days
-    if diff < 0:  return "scaduta"      # ← ESCLUSA dal filtro sotto
+    if diff < 0:  return "scaduta"
     if diff <= 7: return "in_scadenza"
     return "attiva"
 
@@ -95,8 +94,8 @@ def riga_to_gara(r):
     scad_raw = r.get("data_scadenza_offerta","")
     stato    = mappa_stato(r.get("stato",""), scad_raw)
 
-    # ── SOLO attive e in_scadenza ──────────────────────────────────────────
-    if stato not in ("attiva", "in_scadenza"):
+    # Solo attive e in_scadenza
+    if stato not in ("attiva","in_scadenza"):
         return None
 
     cpv     = r.get("cod_cpv") or ""
@@ -105,6 +104,12 @@ def riga_to_gara(r):
 
     regione = (r.get("sezione_regionale") or "").replace("SEZIONE REGIONALE ","").strip() or None
     cig     = r.get("cig") or None
+
+    # ── URL documenti ────────────────────────────────────────────────────────
+    # url_bando: pagina ANAC con dettaglio CIG e link ai documenti di gara
+    url_bando = f"https://dettaglio-cig.anticorruzione.it/cig/{cig}"
+    # url_portale: portale BDNCP — ricerca diretta per CIG
+    url_portale = None
 
     return {
         "codice_cig":   cig,
@@ -128,15 +133,14 @@ def riga_to_gara(r):
         "data_pubblicazione": parse_data(r.get("data_pubblicazione")),
         "stato":        stato,
         "fonte":        "ANAC",
-        "url_bando":    f"https://dati.anticorruzione.it/superset/dashboard/dettaglio_cig/?cig={cig}",
-        "url_portale":  None,
+        "url_bando":    url_bando,
+        "url_portale":  url_portale,
         "id_sintel":    None,
         "codice_gara":  r.get("numero_gara") or None,
         "rup":          None,
     }
 
 def insert_batch(gare):
-    """Insert batch — se fallisce riprova riga per riga (gestisce duplicati)"""
     inserite = 0
     for i in range(0, len(gare), BATCH_SIZE):
         batch = gare[i:i+BATCH_SIZE]
@@ -145,7 +149,7 @@ def insert_batch(gare):
         if r.status_code in (200, 201):
             inserite += len(batch)
         else:
-            # Batch fallito — prova riga per riga
+            # Batch fallito → riga per riga per non perdere nessuna gara
             for gara in batch:
                 r2 = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
                     headers=HEADERS_SB, json=[gara], timeout=15)
@@ -201,7 +205,7 @@ def import_ted():
     except Exception as e:
         return {"fonte":"TED_EU","inserite":0,"errore":str(e)}
 
-    print(f"  📡 {len(notices)} notices ricevute")
+    print(f"  📡 {len(notices)} notices")
     oggi = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     gare = []
     for n in notices:
@@ -212,11 +216,10 @@ def import_ted():
         scad = n.get("deadline-receipt-request") or ""
         if scad and "+" not in scad and not scad.endswith("Z"): scad += "+00:00"
 
-        # Calcola stato
         scad_date = parse_scad_date(scad[:10] if scad else "")
         if scad_date:
             diff = (scad_date - date.today()).days
-            if diff < 0:   continue           # scaduta → salta
+            if diff < 0:    continue  # scaduta → salta
             elif diff <= 7: stato_ted = "in_scadenza"
             else:           stato_ted = "attiva"
         else:
@@ -225,6 +228,10 @@ def import_ted():
         importo = (n.get("estimated-value") or {}).get("amount",0)
         pub_num = (n.get("publication-number") or "").strip()
         pub_url = pub_num.replace("/","-").replace(" ","-")
+
+        # URL documenti TED
+        url_bando    = f"https://ted.europa.eu/en/notice/-/detail/{pub_url}"
+        url_portale  = f"https://enotices2.ted.europa.eu/notice/{pub_url}"
 
         gare.append({
             "codice_cig":None,
@@ -244,8 +251,8 @@ def import_ted():
             "data_pubblicazione":oggi,
             "stato":stato_ted,
             "fonte":"TED_EU",
-            "url_bando":f"https://ted.europa.eu/en/notice/-/detail/{pub_url}",
-            "url_portale":None,
+            "url_bando":url_bando,
+            "url_portale":url_portale,
             "id_sintel":None,
             "codice_gara":pub_num or None,
             "rup":None,
