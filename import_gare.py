@@ -1,5 +1,5 @@
 """
-import_gare.py — Fix stato CHECK constraint + TED pageSize
+import_gare.py — Solo gare ATTIVE e IN_SCADENZA + fix batch duplicati
 """
 import os, io, csv, json, zipfile, requests
 from datetime import datetime, date
@@ -28,13 +28,12 @@ KEYWORDS   = [
     "verde pubblico","sfalcio","vigilanza","portierato","ascensori","elevatori",
 ]
 IMPORTO_MIN = 40_000
-BATCH_SIZE  = 100
+BATCH_SIZE  = 50
 
 def cpv_ok(cpv):  return any((cpv or "")[:4].startswith(p) for p in CPV_TARGET)
 def kw_ok(txt):   return any(k in (txt or "").lower() for k in KEYWORDS)
 
 def parse_data(d):
-    """DD/MM/YYYY o YYYY-MM-DD → timestamptz"""
     if not d: return None
     d = str(d).strip()
     try:
@@ -49,7 +48,6 @@ def parse_data(d):
     return None
 
 def parse_scad_date(d):
-    """Ritorna oggetto date per calcolare lo stato"""
     if not d: return None
     d = str(d).strip()
     try:
@@ -62,19 +60,16 @@ def parse_scad_date(d):
     return None
 
 def mappa_stato(stato_anac, scadenza_raw):
-    """Mappa su valori accettati: attiva | in_scadenza | scaduta | aggiudicata"""
     stato = (stato_anac or "").upper()
     if stato in ("AGGIUDICATA","AGGIUDICATO","ESITATA","ESITATO"):
         return "aggiudicata"
     if stato in ("ANNULLATO","CANCELLATO"):
-        return None  # non inserire
-    # Determina in base alla scadenza
+        return None
     scad = parse_scad_date(scadenza_raw)
     if not scad:
         return "attiva"
-    oggi = date.today()
-    diff = (scad - oggi).days
-    if diff < 0:  return "scaduta"
+    diff = (scad - date.today()).days
+    if diff < 0:  return "scaduta"      # ← ESCLUSA dal filtro sotto
     if diff <= 7: return "in_scadenza"
     return "attiva"
 
@@ -97,10 +92,12 @@ def riga_to_gara(r):
         importo = parse_importo(r.get("importo_lotto"))
     if importo < IMPORTO_MIN: return None
 
-    stato_anac = r.get("stato","")
-    scad_raw   = r.get("data_scadenza_offerta","")
-    stato      = mappa_stato(stato_anac, scad_raw)
-    if stato is None: return None  # annullate/cancellate
+    scad_raw = r.get("data_scadenza_offerta","")
+    stato    = mappa_stato(r.get("stato",""), scad_raw)
+
+    # ── SOLO attive e in_scadenza ──────────────────────────────────────────
+    if stato not in ("attiva", "in_scadenza"):
+        return None
 
     cpv     = r.get("cod_cpv") or ""
     oggetto = r.get("oggetto_gara") or ""
@@ -131,7 +128,7 @@ def riga_to_gara(r):
         "data_pubblicazione": parse_data(r.get("data_pubblicazione")),
         "stato":        stato,
         "fonte":        "ANAC",
-        "url_bando":    f"https://api.anticorruzione.it/apicig/1.0.0/getSmartCig/{cig}",
+        "url_bando":    f"https://dati.anticorruzione.it/superset/dashboard/dettaglio_cig/?cig={cig}",
         "url_portale":  None,
         "id_sintel":    None,
         "codice_gara":  r.get("numero_gara") or None,
@@ -139,8 +136,8 @@ def riga_to_gara(r):
     }
 
 def insert_batch(gare):
+    """Insert batch — se fallisce riprova riga per riga (gestisce duplicati)"""
     inserite = 0
-    errori   = 0
     for i in range(0, len(gare), BATCH_SIZE):
         batch = gare[i:i+BATCH_SIZE]
         r = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
@@ -148,10 +145,13 @@ def insert_batch(gare):
         if r.status_code in (200, 201):
             inserite += len(batch)
         else:
-            errori += len(batch)
-            if errori <= BATCH_SIZE:
-                print(f"  ⚠️  Errore {r.status_code}: {r.text[:300]}")
-    return inserite, errori
+            # Batch fallito — prova riga per riga
+            for gara in batch:
+                r2 = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
+                    headers=HEADERS_SB, json=[gara], timeout=15)
+                if r2.status_code in (200, 201):
+                    inserite += 1
+    return inserite
 
 def import_anac():
     print("🇮🇹 ANAC — scarico via Cloudflare Worker")
@@ -161,20 +161,20 @@ def import_anac():
 
     anac_url  = r.headers.get("X-Anac-Url","n/d")
     zip_bytes = r.content
-    print(f"  ✅ ZIP: {len(zip_bytes)/1e6:.1f} MB")
+    print(f"  ✅ ZIP: {len(zip_bytes)/1e6:.1f} MB ({anac_url})")
 
     gare  = []
     righe = 0
-    stati = {"attiva":0,"in_scadenza":0,"scaduta":0,"aggiudicata":0,"escluse":0}
+    stati = {}
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
         if not csv_name:
             return {"fonte":"ANAC","inserite":0,"errore":"CSV non trovato"}
         with zf.open(csv_name) as f:
-            raw    = f.read()
-            fl     = raw.split(b"\n")[0].decode("iso-8859-1","replace")
-            sep    = ";" if fl.count(";") > fl.count(",") else ","
+            raw  = f.read()
+            fl   = raw.split(b"\n")[0].decode("iso-8859-1","replace")
+            sep  = ";" if fl.count(";") > fl.count(",") else ","
             reader = csv.DictReader(
                 io.TextIOWrapper(io.BytesIO(raw), encoding="iso-8859-1"),
                 delimiter=sep
@@ -185,27 +185,14 @@ def import_anac():
                 if g:
                     gare.append(g)
                     stati[g["stato"]] = stati.get(g["stato"],0) + 1
-                else:
-                    stati["escluse"] = stati.get("escluse",0) + 1
 
-    print(f"  📊 {righe} righe → {len(gare)} filtrate")
-    print(f"     stati: {stati}")
-    inserite, errori = insert_batch(gare)
-    print(f"  ✅ {inserite} inserite, {errori} errori")
-    return {"fonte":"ANAC","url":anac_url,"righe_csv":righe,"filtrate":len(gare),"inserite":inserite,"errori":errori}
-
-def mappa_stato_ted(scadenza_raw):
-    """Stato per gare TED basato su scadenza"""
-    scad = parse_scad_date(scadenza_raw[:10] if scadenza_raw else "")
-    if not scad: return "attiva"
-    diff = (scad - date.today()).days
-    if diff < 0:  return "scaduta"
-    if diff <= 7: return "in_scadenza"
-    return "attiva"
+    print(f"  📊 {righe} righe → {len(gare)} gare attive/in_scadenza: {stati}")
+    inserite = insert_batch(gare)
+    print(f"  ✅ {inserite} nuove gare inserite")
+    return {"fonte":"ANAC","url":anac_url,"righe_csv":righe,"filtrate":len(gare),"inserite":inserite}
 
 def import_ted():
     print("🇪🇺 TED — scarico via Cloudflare Worker")
-    # Nessun pageSize — rimosso perché TED v3 non lo supporta
     r = requests.post(f"{WORKER_URL}/ted", json={}, timeout=60)
     print(f"  HTTP {r.status_code}: {r.text[:200]}")
     try:
@@ -214,43 +201,64 @@ def import_ted():
     except Exception as e:
         return {"fonte":"TED_EU","inserite":0,"errore":str(e)}
 
-    print(f"  📡 {len(notices)} notices")
+    print(f"  📡 {len(notices)} notices ricevute")
     oggi = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     gare = []
     for n in notices:
         cpv    = n.get("cpv-code","")
         titolo = n.get("title","")
         if not cpv_ok(cpv) and not kw_ok(titolo): continue
+
+        scad = n.get("deadline-receipt-request") or ""
+        if scad and "+" not in scad and not scad.endswith("Z"): scad += "+00:00"
+
+        # Calcola stato
+        scad_date = parse_scad_date(scad[:10] if scad else "")
+        if scad_date:
+            diff = (scad_date - date.today()).days
+            if diff < 0:   continue           # scaduta → salta
+            elif diff <= 7: stato_ted = "in_scadenza"
+            else:           stato_ted = "attiva"
+        else:
+            stato_ted = "attiva"
+
         importo = (n.get("estimated-value") or {}).get("amount",0)
         pub_num = (n.get("publication-number") or "").strip()
         pub_url = pub_num.replace("/","-").replace(" ","-")
-        scad    = n.get("deadline-receipt-request") or ""
-        if scad and "+" not in scad and not scad.endswith("Z"): scad += "+00:00"
-        stato_ted = mappa_stato_ted(scad)
+
         gare.append({
-            "codice_cig":None,"titolo":(titolo or "(n/d)")[:500],
+            "codice_cig":None,
+            "titolo":(titolo or "(n/d)")[:500],
             "descrizione":None,"riassunto_ai":None,"keywords_ai":[],"settore_ai":None,
             "ente":n.get("contracting-authority-name") or None,
-            "regione":"ITALIA","provincia":n.get("place-of-performance") or None,"comune":None,
-            "categoria_cpv":cpv[:20] if cpv else None,"categoria_label":None,
-            "procedura":"Procedura aperta (EU)","criterio_aggiudicazione":None,
+            "regione":"ITALIA",
+            "provincia":n.get("place-of-performance") or None,
+            "comune":None,
+            "categoria_cpv":cpv[:20] if cpv else None,
+            "categoria_label":None,
+            "procedura":"Procedura aperta (EU)",
+            "criterio_aggiudicazione":None,
             "importo_min":None,"importo_max":None,
             "importo_totale":float(importo) if importo else None,
-            "scadenza":scad or None,"data_pubblicazione":oggi,
-            "stato":stato_ted,"fonte":"TED_EU",
+            "scadenza":scad or None,
+            "data_pubblicazione":oggi,
+            "stato":stato_ted,
+            "fonte":"TED_EU",
             "url_bando":f"https://ted.europa.eu/en/notice/-/detail/{pub_url}",
             "url_portale":None,
-            "id_sintel":None,"codice_gara":pub_num or None,"rup":None,
+            "id_sintel":None,
+            "codice_gara":pub_num or None,
+            "rup":None,
         })
 
-    print(f"  📊 {len(gare)} filtrate")
-    inserite, errori = insert_batch(gare)
-    print(f"  ✅ {inserite} inserite")
+    print(f"  📊 {len(gare)} gare attive/in_scadenza filtrate")
+    inserite = insert_batch(gare)
+    print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"TED_EU","notices":len(notices),"filtrate":len(gare),"inserite":inserite}
 
 if __name__ == "__main__":
     print(f"🚀 Gare Intelligence — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     risultati = [import_anac(), import_ted()]
     tot = sum(r.get("inserite",0) for r in risultati)
-    print(f"\n✅ TOTALE: {tot} gare inserite")
+    print(f"\n✅ TOTALE: {tot} nuove gare inserite")
     print(json.dumps(risultati, indent=2, ensure_ascii=False))
