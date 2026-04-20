@@ -354,6 +354,157 @@ def import_ted():
     return {"fonte":"TED_EU","totale":totale,"pagine":pagina-1,"filtrate":len(gare),"inserite":inserite}
 
 
+
+def import_aria_lombardia():
+    """Bandi aperti di Regione Lombardia via API AGORA ARIA"""
+    print("🟢 ARIA LOMBARDIA — Catalogo Bandi")
+
+    CLIENT_ID     = os.environ.get("ARIA_CLIENT_ID", "")
+    CLIENT_SECRET = os.environ.get("ARIA_CLIENT_SECRET", "")
+    BASE_URL      = "https://api.servizirl.it/c/servizi.rl/agora_catalogo/v2.0.0"
+    TOKEN_URL     = "https://api.servizirl.it/oauth2/token"
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("  ⚠️  ARIA_CLIENT_ID o ARIA_CLIENT_SECRET non configurati — skip")
+        return {"fonte":"ARIA_LOMBARDIA","inserite":0,"errore":"Credenziali mancanti"}
+
+    # 1. Ottieni token OAuth2
+    import base64
+    credentials = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+    try:
+        r = requests.post(TOKEN_URL,
+            headers={
+                "Content-Type":  "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {credentials}",
+            },
+            data="grant_type=client_credentials&scope=agora_catalogo_bandi",
+            timeout=30
+        )
+        token = r.json().get("access_token")
+        if not token:
+            print(f"  ❌ Token non ottenuto: {r.text[:200]}")
+            return {"fonte":"ARIA_LOMBARDIA","inserite":0,"errore":"Token fallito"}
+        print(f"  ✅ Token ottenuto (expires_in: {r.json().get('expires_in')}s)")
+    except Exception as e:
+        return {"fonte":"ARIA_LOMBARDIA","inserite":0,"errore":str(e)}
+
+    headers_api = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    # 2. Scarica bandi APERTI e IN APERTURA con paginazione
+    gare   = []
+    start  = 0
+    count  = 100
+    totale = None
+    oggi   = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
+
+    while True:
+        body = {
+            "Stato": ["APERTO", "IN APERTURA"],
+            "Ordinamento": [{"Campo": "DataFine", "Tipo": "ASC"}]
+        }
+        try:
+            r = requests.post(
+                f"{BASE_URL}/catalogo/ricerca?start={start}&count={count}",
+                headers=headers_api,
+                json=body,
+                timeout=30
+            )
+            data = r.json()
+        except Exception as e:
+            print(f"  ❌ Errore pagina start={start}: {e}")
+            break
+
+        lista    = data.get("Lista", data.get("lista", []))
+        n_totale = data.get("NumeroRisultati", data.get("numeroRisultati", 0))
+
+        if totale is None:
+            totale = n_totale
+            print(f"  📊 {totale} bandi aperti trovati")
+
+        if not lista:
+            break
+
+        for b in lista:
+            # Date EPOCH ms → ISO
+            data_fine   = b.get("DataFine")
+            data_inizio = b.get("DataInizio")
+            scadenza    = None
+            data_pub    = None
+            stato_db    = "attiva"
+
+            if data_fine:
+                from datetime import timezone
+                scad_dt  = datetime.fromtimestamp(data_fine / 1000, tz=timezone.utc)
+                scadenza = scad_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                diff = (scad_dt.date() - date.today()).days
+                if diff < 0:   stato_db = "scaduta"
+                elif diff <= 7: stato_db = "in_scadenza"
+
+            if data_inizio:
+                from datetime import timezone
+                pub_dt  = datetime.fromtimestamp(data_inizio / 1000, tz=timezone.utc)
+                data_pub = pub_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+            stato_api = (b.get("Stato") or "").upper()
+            if stato_api == "CHIUSO":
+                continue
+
+            # Ente responsabile
+            ente_obj = b.get("EnteResponsabile") or {}
+            ente = (ente_obj.get("Descrizione") or
+                    ente_obj.get("denominazione") or
+                    "Regione Lombardia")
+
+            # URL bando
+            url_bando   = b.get("LinkPiattaforma") or b.get("RefUrl") or ""
+            url_portale = b.get("RefUrl") or None
+
+            codice = b.get("Codice") or b.get("ID") or None
+
+            gare.append({
+                "codice_cig":   None,
+                "titolo":       (b.get("Titolo") or "(n/d)")[:500],
+                "descrizione":  b.get("Abstract") or None,
+                "riassunto_ai": None,
+                "keywords_ai":  [],
+                "settore_ai":   None,
+                "ente":         ente,
+                "regione":      "LOMBARDIA",
+                "provincia":    None,
+                "comune":       None,
+                "categoria_cpv":   None,
+                "categoria_label": None,
+                "procedura":    b.get("Tipologia", {}).get("Descrizione") if isinstance(b.get("Tipologia"), dict) else None,
+                "criterio_aggiudicazione": None,
+                "importo_min":  None,
+                "importo_max":  None,
+                "importo_totale": None,
+                "scadenza":           scadenza,
+                "data_pubblicazione": data_pub or oggi,
+                "stato":        stato_db,
+                "fonte":        "ARIA_LOMBARDIA",
+                "url_bando":    url_bando or None,
+                "url_portale":  url_portale,
+                "id_sintel":    None,
+                "codice_gara":  codice,
+                "rup":          None,
+            })
+
+        start += count
+        if start >= (totale or 0):
+            break
+
+    # Filtra solo attive/in_scadenza
+    gare = [g for g in gare if g["stato"] in ("attiva", "in_scadenza")]
+    print(f"  📊 {len(gare)} bandi attivi/in scadenza")
+    inserite = insert_batch(gare)
+    print(f"  ✅ {inserite} nuove gare inserite")
+    return {"fonte":"ARIA_LOMBARDIA","totale":totale,"filtrate":len(gare),"inserite":inserite}
+
+
 if __name__ == "__main__":
     print(f"🚀 Gare Intelligence [{MODE.upper()}] — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     risultati = []
