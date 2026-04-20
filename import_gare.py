@@ -1,7 +1,6 @@
 """
-import_gare.py — Fix 23514 + TED pageSize
+import_gare.py — Fix date DD/MM/YYYY + importo
 """
-
 import os, io, csv, json, zipfile, requests
 from datetime import datetime
 
@@ -29,37 +28,57 @@ KEYWORDS   = [
     "verde pubblico","sfalcio","vigilanza","portierato","ascensori","elevatori",
 ]
 IMPORTO_MIN = 40_000
-BATCH_SIZE  = 50
+BATCH_SIZE  = 100
 
 def cpv_ok(cpv):  return any((cpv or "")[:4].startswith(p) for p in CPV_TARGET)
 def kw_ok(txt):   return any(k in (txt or "").lower() for k in KEYWORDS)
 
-def to_ts(d):
+def parse_data(d):
+    """Converte DD/MM/YYYY o YYYY-MM-DD in timestamptz ISO"""
     if not d: return None
     d = str(d).strip()
-    if len(d) == 10:  # YYYY-MM-DD
-        return d + "T00:00:00+00:00"
-    if "T" in d:
-        return d if ("+" in d or d.endswith("Z")) else d + "+00:00"
+    if not d: return None
+    try:
+        # Formato ANAC: DD/MM/YYYY
+        if len(d) == 10 and d[2] == "/" and d[5] == "/":
+            dd, mm, yyyy = d.split("/")
+            return f"{yyyy}-{mm}-{dd}T00:00:00+00:00"
+        # Formato ISO: YYYY-MM-DD
+        if len(d) == 10 and d[4] == "-":
+            return d + "T00:00:00+00:00"
+        # Già timestamp
+        if "T" in d:
+            return d if ("+" in d or d.endswith("Z")) else d + "+00:00"
+    except:
+        pass
     return None
 
 def parse_importo(val):
+    """Gestisce 631146.08 e 1.250.000,00"""
     if not val: return 0
-    val = str(val).strip()
-    if "," in val and "." in val:
-        val = val.replace(".", "").replace(",", ".")
-    elif "," in val:
-        val = val.replace(",", ".")
-    val = val.replace(" ", "")
-    try:    return float(val)
-    except: return 0
+    val = str(val).strip().replace(" ", "")
+    try:
+        # Se c'è sia punto che virgola: formato italiano
+        if "," in val and "." in val:
+            val = val.replace(".", "").replace(",", ".")
+        # Solo virgola: decimale italiano
+        elif "," in val:
+            val = val.replace(",", ".")
+        # Solo punto: già formato corretto (o migliaia senza decimali)
+        # Se ci sono più punti è formato migliaia (es: 1.000.000)
+        elif val.count(".") > 1:
+            val = val.replace(".", "")
+        return float(val)
+    except:
+        return 0
 
 def riga_to_gara(r):
     importo = parse_importo(r.get("importo_complessivo_gara"))
     if importo == 0:
         importo = parse_importo(r.get("importo_lotto"))
     if importo < IMPORTO_MIN: return None
-    if (r.get("stato") or "").upper() in ("ANNULLATO","CANCELLATO"): return None
+    stato = (r.get("stato") or "").upper()
+    if stato in ("ANNULLATO","CANCELLATO"): return None
     cpv     = r.get("cod_cpv") or ""
     oggetto = r.get("oggetto_gara") or ""
     if not cpv_ok(cpv) and not kw_ok(oggetto): return None
@@ -67,12 +86,12 @@ def riga_to_gara(r):
     cig     = r.get("cig") or None
     return {
         "codice_cig":   cig,
-        "titolo":       (oggetto or r.get("oggetto_lotto") or "(oggetto non disponibile)")[:500],
+        "titolo":       (oggetto or r.get("oggetto_lotto") or "(n/d)")[:500],
         "descrizione":  None,
         "riassunto_ai": None,
         "keywords_ai":  [],
         "settore_ai":   None,
-        "ente":         (r.get("denominazione_amministrazione_appaltante") or None),
+        "ente":         r.get("denominazione_amministrazione_appaltante") or None,
         "regione":      regione,
         "provincia":    r.get("provincia") or None,
         "comune":       None,
@@ -82,9 +101,9 @@ def riga_to_gara(r):
         "criterio_aggiudicazione": None,
         "importo_min":  None,
         "importo_max":  None,
-        "importo_totale": round(importo, 2) if importo > 0 else None,
-        "scadenza":           to_ts(r.get("data_scadenza_offerta")),
-        "data_pubblicazione": to_ts(r.get("data_pubblicazione")),
+        "importo_totale": round(importo, 2),
+        "scadenza":           parse_data(r.get("data_scadenza_offerta")),
+        "data_pubblicazione": parse_data(r.get("data_pubblicazione")),
         "stato":        "PUBBLICATA",
         "fonte":        "ANAC",
         "url_bando":    f"https://api.anticorruzione.it/apicig/1.0.0/getSmartCig/{cig}",
@@ -95,38 +114,18 @@ def riga_to_gara(r):
     }
 
 def insert_batch(gare):
-    """Insert batch — se fallisce prova riga per riga per isolare errori"""
-    inserite   = 0
-    errori     = 0
-    primo_err  = None
-
+    inserite = 0
+    errori   = 0
     for i in range(0, len(gare), BATCH_SIZE):
         batch = gare[i:i+BATCH_SIZE]
         r = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
             headers=HEADERS_SB, json=batch, timeout=30)
-
         if r.status_code in (200, 201):
             inserite += len(batch)
         else:
-            # Batch fallito → prova riga per riga
-            for gara in batch:
-                r2 = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
-                    headers=HEADERS_SB, json=[gara], timeout=15)
-                if r2.status_code in (200, 201):
-                    inserite += 1
-                else:
-                    errori += 1
-                    if primo_err is None:
-                        # Stampa il primo errore completo per debug
-                        primo_err = r2.text
-                        print(f"\n  🔴 PRIMO ERRORE COMPLETO:")
-                        print(f"     HTTP: {r2.status_code}")
-                        print(f"     Body: {r2.text[:500]}")
-                        print(f"     Riga problematica:")
-                        for k, v in gara.items():
-                            if v is not None:
-                                print(f"       {k}: {repr(v)[:80]}")
-
+            errori += len(batch)
+            if errori <= BATCH_SIZE:  # stampa solo il primo errore
+                print(f"  ⚠️  Batch errore {r.status_code}: {r.text[:300]}")
     return inserite, errori
 
 def import_anac():
@@ -139,8 +138,11 @@ def import_anac():
     zip_bytes = r.content
     print(f"  ✅ ZIP: {len(zip_bytes)/1e6:.1f} MB")
 
+    # Debug: mostra parse date su prima riga
     gare  = []
     righe = 0
+    data_sample_shown = False
+
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
         if not csv_name:
@@ -149,12 +151,22 @@ def import_anac():
             raw  = f.read()
             fl   = raw.split(b"\n")[0].decode("iso-8859-1","replace")
             sep  = ";" if fl.count(";") > fl.count(",") else ","
+            print(f"  📄 Separatore: '{sep}'")
             reader = csv.DictReader(
                 io.TextIOWrapper(io.BytesIO(raw), encoding="iso-8859-1"),
                 delimiter=sep
             )
             for row in reader:
                 righe += 1
+                # Debug prima riga
+                if not data_sample_shown:
+                    data_sample_shown = True
+                    imp_raw = row.get("importo_complessivo_gara","")
+                    dat_raw = row.get("data_pubblicazione","")
+                    print(f"  🔍 Debug prima riga:")
+                    print(f"     importo raw: '{imp_raw}' → {parse_importo(imp_raw)}")
+                    print(f"     data_pub raw: '{dat_raw}' → {parse_data(dat_raw)}")
+                    print(f"     scadenza raw: '{row.get('data_scadenza_offerta','')}' → {parse_data(row.get('data_scadenza_offerta',''))}")
                 g = riga_to_gara(row)
                 if g: gare.append(g)
 
@@ -165,9 +177,9 @@ def import_anac():
 
 def import_ted():
     print("🇪🇺 TED — scarico via Cloudflare Worker")
-    # Rimosso pageSize che TED v3 non accetta
+    # Nessun pageSize — TED v3 non lo supporta
     r = requests.post(f"{WORKER_URL}/ted", json={}, timeout=60)
-    print(f"  HTTP {r.status_code}")
+    print(f"  HTTP {r.status_code}: {r.text[:200]}")
     try:
         data    = r.json()
         notices = data.get("notices", data.get("results", []))
@@ -204,7 +216,7 @@ def import_ted():
 
     print(f"  📊 {len(gare)} filtrate")
     inserite, errori = insert_batch(gare)
-    print(f"  ✅ {inserite} inserite, {errori} errori")
+    print(f"  ✅ {inserite} inserite")
     return {"fonte":"TED_EU","notices":len(notices),"filtrate":len(gare),"inserite":inserite}
 
 if __name__ == "__main__":
