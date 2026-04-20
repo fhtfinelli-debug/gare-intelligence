@@ -270,9 +270,10 @@ def import_ted():
 
                 pub_num = (n.get("publication-number") or "").strip()
 
-                # URL bando italiano
+                # URL bando e PDF italiano
                 links     = n.get("links") or {}
                 html_link = (links.get("html") or {}).get("ITA") or                             f"https://ted.europa.eu/it/notice/-/detail/{pub_num}"
+                pdf_link  = (links.get("pdf") or {}).get("ITA") or None
 
                 pop       = n.get("place-of-performance") or []
                 provincia = pop[0] if pop else None
