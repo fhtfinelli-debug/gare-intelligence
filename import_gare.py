@@ -1,5 +1,8 @@
 """
-import_gare.py — Solo ATTIVE/IN_SCADENZA + URL documenti corretti
+import_gare.py — FINAL
+- Giornaliero: CSV delta ANAC (gare nuove di giornata) + TED
+- Mensile: ZIP CSV ANAC (recupero gare mancate)
+Modalità: env var MODE = 'daily' (default) o 'monthly'
 """
 import os, io, csv, json, zipfile, requests
 from datetime import datetime, date
@@ -7,6 +10,7 @@ from datetime import datetime, date
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://efhdooeqscqncgvhqfyu.supabase.co")
 SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY", "")
 WORKER_URL   = os.environ.get("WORKER_URL", "https://gare-relay.finellimanuel.workers.dev")
+MODE         = os.environ.get("MODE", "daily")  # daily o monthly
 
 HEADERS_SB = {
     "apikey":        SERVICE_KEY,
@@ -93,8 +97,6 @@ def riga_to_gara(r):
 
     scad_raw = r.get("data_scadenza_offerta","")
     stato    = mappa_stato(r.get("stato",""), scad_raw)
-
-    # Solo attive e in_scadenza
     if stato not in ("attiva","in_scadenza"):
         return None
 
@@ -104,12 +106,6 @@ def riga_to_gara(r):
 
     regione = (r.get("sezione_regionale") or "").replace("SEZIONE REGIONALE ","").strip() or None
     cig     = r.get("cig") or None
-
-    # ── URL documenti ────────────────────────────────────────────────────────
-    # url_bando: pagina ANAC con dettaglio CIG e link ai documenti di gara
-    url_bando = f"https://dettaglio-cig.anticorruzione.it/cig/{cig}"
-    # url_portale: portale BDNCP — ricerca diretta per CIG
-    url_portale = None
 
     return {
         "codice_cig":   cig,
@@ -133,12 +129,32 @@ def riga_to_gara(r):
         "data_pubblicazione": parse_data(r.get("data_pubblicazione")),
         "stato":        stato,
         "fonte":        "ANAC",
-        "url_bando":    url_bando,
-        "url_portale":  url_portale,
+        "url_bando":    f"https://dettaglio-cig.anticorruzione.it/cig/{cig}",
+        "url_portale":  None,
         "id_sintel":    None,
         "codice_gara":  r.get("numero_gara") or None,
         "rup":          None,
     }
+
+def processa_csv(raw_bytes, sep=None):
+    """Parse CSV bytes → lista gare filtrate"""
+    fl  = raw_bytes.split(b"\n")[0].decode("iso-8859-1","replace")
+    if sep is None:
+        sep = ";" if fl.count(";") > fl.count(",") else ","
+    reader = csv.DictReader(
+        io.TextIOWrapper(io.BytesIO(raw_bytes), encoding="iso-8859-1"),
+        delimiter=sep
+    )
+    gare  = []
+    righe = 0
+    stati = {}
+    for row in reader:
+        righe += 1
+        g = riga_to_gara(row)
+        if g:
+            gare.append(g)
+            stati[g["stato"]] = stati.get(g["stato"],0) + 1
+    return righe, gare, stati
 
 def insert_batch(gare):
     inserite = 0
@@ -149,7 +165,6 @@ def insert_batch(gare):
         if r.status_code in (200, 201):
             inserite += len(batch)
         else:
-            # Batch fallito → riga per riga per non perdere nessuna gara
             for gara in batch:
                 r2 = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
                     headers=HEADERS_SB, json=[gara], timeout=15)
@@ -157,48 +172,49 @@ def insert_batch(gare):
                     inserite += 1
     return inserite
 
-def import_anac():
-    print("🇮🇹 ANAC — scarico via Cloudflare Worker")
+def import_anac_daily():
+    """Delta giornaliero — gare nuove/modificate oggi"""
+    print("🇮🇹 ANAC DELTA (giornaliero)")
+    url = f"{WORKER_URL}/anac-delta"
+    r   = requests.get(url, timeout=60)
+    if r.status_code != 200:
+        return {"fonte":"ANAC_DELTA","inserite":0,"errore":f"HTTP {r.status_code}: {r.text[:100]}"}
+
+    print(f"  ✅ CSV delta: {len(r.content)/1e3:.0f} KB")
+    righe, gare, stati = processa_csv(r.content)
+    print(f"  📊 {righe} righe → {len(gare)} attive/in_scadenza: {stati}")
+    inserite = insert_batch(gare)
+    print(f"  ✅ {inserite} nuove gare inserite")
+    return {"fonte":"ANAC_DELTA","righe":righe,"filtrate":len(gare),"inserite":inserite}
+
+def import_anac_monthly():
+    """ZIP mensile — recupero completo mese precedente"""
+    print("🇮🇹 ANAC ZIP (mensile)")
     r = requests.get(f"{WORKER_URL}/anac", timeout=180, stream=True)
     if r.status_code != 200:
-        return {"fonte":"ANAC","inserite":0,"errore":f"HTTP {r.status_code}"}
+        return {"fonte":"ANAC_ZIP","inserite":0,"errore":f"HTTP {r.status_code}"}
 
     anac_url  = r.headers.get("X-Anac-Url","n/d")
     zip_bytes = r.content
     print(f"  ✅ ZIP: {len(zip_bytes)/1e6:.1f} MB ({anac_url})")
 
-    gare  = []
-    righe = 0
-    stati = {}
-
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
         if not csv_name:
-            return {"fonte":"ANAC","inserite":0,"errore":"CSV non trovato"}
+            return {"fonte":"ANAC_ZIP","inserite":0,"errore":"CSV non trovato"}
         with zf.open(csv_name) as f:
-            raw  = f.read()
-            fl   = raw.split(b"\n")[0].decode("iso-8859-1","replace")
-            sep  = ";" if fl.count(";") > fl.count(",") else ","
-            reader = csv.DictReader(
-                io.TextIOWrapper(io.BytesIO(raw), encoding="iso-8859-1"),
-                delimiter=sep
-            )
-            for row in reader:
-                righe += 1
-                g = riga_to_gara(row)
-                if g:
-                    gare.append(g)
-                    stati[g["stato"]] = stati.get(g["stato"],0) + 1
+            raw = f.read()
 
-    print(f"  📊 {righe} righe → {len(gare)} gare attive/in_scadenza: {stati}")
+    righe, gare, stati = processa_csv(raw)
+    print(f"  📊 {righe} righe → {len(gare)} attive/in_scadenza: {stati}")
     inserite = insert_batch(gare)
     print(f"  ✅ {inserite} nuove gare inserite")
-    return {"fonte":"ANAC","url":anac_url,"righe_csv":righe,"filtrate":len(gare),"inserite":inserite}
+    return {"fonte":"ANAC_ZIP","url":anac_url,"righe":righe,"filtrate":len(gare),"inserite":inserite}
 
 def import_ted():
-    print("🇪🇺 TED — scarico via Cloudflare Worker")
+    print("🇪🇺 TED EU")
     r = requests.post(f"{WORKER_URL}/ted", json={}, timeout=60)
-    print(f"  HTTP {r.status_code}: {r.text[:200]}")
+    print(f"  HTTP {r.status_code}: {r.text[:150]}")
     try:
         data    = r.json()
         notices = data.get("notices", data.get("results", []))
@@ -212,60 +228,49 @@ def import_ted():
         cpv    = n.get("cpv-code","")
         titolo = n.get("title","")
         if not cpv_ok(cpv) and not kw_ok(titolo): continue
-
         scad = n.get("deadline-receipt-request") or ""
         if scad and "+" not in scad and not scad.endswith("Z"): scad += "+00:00"
-
         scad_date = parse_scad_date(scad[:10] if scad else "")
         if scad_date:
             diff = (scad_date - date.today()).days
-            if diff < 0:    continue  # scaduta → salta
+            if diff < 0:    continue
             elif diff <= 7: stato_ted = "in_scadenza"
             else:           stato_ted = "attiva"
         else:
             stato_ted = "attiva"
-
         importo = (n.get("estimated-value") or {}).get("amount",0)
         pub_num = (n.get("publication-number") or "").strip()
         pub_url = pub_num.replace("/","-").replace(" ","-")
-
-        # URL documenti TED
-        url_bando    = f"https://ted.europa.eu/en/notice/-/detail/{pub_url}"
-        url_portale  = f"https://enotices2.ted.europa.eu/notice/{pub_url}"
-
         gare.append({
-            "codice_cig":None,
-            "titolo":(titolo or "(n/d)")[:500],
+            "codice_cig":None,"titolo":(titolo or "(n/d)")[:500],
             "descrizione":None,"riassunto_ai":None,"keywords_ai":[],"settore_ai":None,
             "ente":n.get("contracting-authority-name") or None,
-            "regione":"ITALIA",
-            "provincia":n.get("place-of-performance") or None,
-            "comune":None,
-            "categoria_cpv":cpv[:20] if cpv else None,
-            "categoria_label":None,
-            "procedura":"Procedura aperta (EU)",
-            "criterio_aggiudicazione":None,
+            "regione":"ITALIA","provincia":n.get("place-of-performance") or None,"comune":None,
+            "categoria_cpv":cpv[:20] if cpv else None,"categoria_label":None,
+            "procedura":"Procedura aperta (EU)","criterio_aggiudicazione":None,
             "importo_min":None,"importo_max":None,
             "importo_totale":float(importo) if importo else None,
-            "scadenza":scad or None,
-            "data_pubblicazione":oggi,
-            "stato":stato_ted,
-            "fonte":"TED_EU",
-            "url_bando":url_bando,
-            "url_portale":url_portale,
-            "id_sintel":None,
-            "codice_gara":pub_num or None,
-            "rup":None,
+            "scadenza":scad or None,"data_pubblicazione":oggi,
+            "stato":stato_ted,"fonte":"TED_EU",
+            "url_bando":f"https://ted.europa.eu/en/notice/-/detail/{pub_url}",
+            "url_portale":None,"id_sintel":None,"codice_gara":pub_num or None,"rup":None,
         })
-
-    print(f"  📊 {len(gare)} gare attive/in_scadenza filtrate")
+    print(f"  📊 {len(gare)} attive/in_scadenza")
     inserite = insert_batch(gare)
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"TED_EU","notices":len(notices),"filtrate":len(gare),"inserite":inserite}
 
 if __name__ == "__main__":
-    print(f"🚀 Gare Intelligence — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    risultati = [import_anac(), import_ted()]
+    print(f"🚀 Gare Intelligence [{MODE.upper()}] — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    risultati = []
+
+    if MODE == "monthly":
+        risultati.append(import_anac_monthly())
+    else:
+        risultati.append(import_anac_daily())
+
+    risultati.append(import_ted())
+
     tot = sum(r.get("inserite",0) for r in risultati)
     print(f"\n✅ TOTALE: {tot} nuove gare inserite")
     print(json.dumps(risultati, indent=2, ensure_ascii=False))
