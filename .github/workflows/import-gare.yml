@@ -26,5 +26,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
         run: python import_gare.py
-        WORKER_URL: ${{ secrets.WORKER_URL }}
