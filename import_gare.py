@@ -19,8 +19,20 @@ HEADERS_SB = {
     "Prefer":        "resolution=ignore-duplicates,return=minimal",
 }
 
-CPV_TARGET = ["7999","5070","9091","7131","4521","5153","7200","4500","3913","7132","5050","9000"]
+CPV_TARGET = [
+    # Facility management, manutenzione, pulizia, HVAC, impianti
+    "7999","5070","9091","7131","4521","5153","7200","4500","3913","7132","5050","9000",
+    # Edilizia e costruzioni
+    "4500","4510","4511","4512","4513","4514","4515","4516","4517","4518","4519",
+    "4520","4521","4522","4523","4524","4525","4526","4527","4528","4529",
+    "4530","4531","4532","4533","4534","4540","4541","4542","4543","4544","4545",
+    "4550","4551","4552","4553","4554","4560","4561","4570","4580","4590",
+    # Progettazione, architettura, ingegneria
+    "7111","7112","7120","7121","7122","7123","7124","7125","7126","7127","7128","7129",
+    "7130","7131","7132","7133","7134","7140","7141","7142","7143","7144","7148",
+]
 KEYWORDS   = [
+    # Facility management
     "facility management","facility",
     "manutenzione ordinaria","manutenzione straordinaria","manutenzione",
     "pulizia","sanificazione","disinfezione","igienizzazione",
@@ -30,6 +42,19 @@ KEYWORDS   = [
     "climatizzazione","condizionamento aria",
     "antincendio","energy service","efficienza energetica",
     "verde pubblico","sfalcio","vigilanza","portierato","ascensori","elevatori",
+    # Edilizia e costruzioni
+    "lavori edili","lavori edilizi","opere edili","costruzione",
+    "ristrutturazione edilizia","recupero edilizio","restauro",
+    "manutenzione stradale","opere stradali","pavimentazione",
+    "impermeabilizzazione","coperture","tetti","facciate",
+    "consolidamento","adeguamento sismico","miglioramento sismico",
+    "bonifica","demolizione","ampliamento",
+    # Progettazione e ingegneria
+    "progettazione","progetto esecutivo","progetto definitivo",
+    "direzione lavori","collaudo","verifica progetto",
+    "architettura","architetto","ingegneria","ingegnere",
+    "studio di fattibilità","relazione tecnica",
+    "rilievo topografico","indagini geotecniche",
 ]
 IMPORTO_MIN = 1_000
 BATCH_SIZE  = 50
