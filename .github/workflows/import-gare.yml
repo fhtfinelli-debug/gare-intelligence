@@ -2,8 +2,20 @@ name: Import Gare Pubbliche
 
 on:
   schedule:
+    # Ogni giorno feriale alle 08:00 ora italiana (07:00 UTC) — delta giornaliero
     - cron: '0 7 * * 1-5'
+    # Il 2 di ogni mese alle 06:00 UTC — ZIP mensile completo
+    - cron: '0 6 2 * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Modalità import'
+        required: false
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - monthly
 
 jobs:
   import:
@@ -22,9 +34,23 @@ jobs:
       - name: Installa dipendenze
         run: pip install requests python-dateutil
 
+      - name: Determina modalità
+        id: mode
+        run: |
+          # Se avviato manualmente usa il parametro scelto
+          # Se è il 2 del mese usa monthly, altrimenti daily
+          if [ "${{ github.event.inputs.mode }}" != "" ]; then
+            echo "MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
+          elif [ "$(date +%d)" = "02" ]; then
+            echo "MODE=monthly" >> $GITHUB_ENV
+          else
+            echo "MODE=daily" >> $GITHUB_ENV
+          fi
+
       - name: Esegui import gare
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
+          MODE: ${{ env.MODE }}
         run: python import_gare.py
