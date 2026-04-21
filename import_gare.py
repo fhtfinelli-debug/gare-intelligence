@@ -342,8 +342,8 @@ def import_aria_lombardia():
     oggi   = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
 
     while True:
+        # Nessun filtro Stato — scarica tutti i bandi e filtra localmente
         body = {
-            "Stato": ["APERTO", "IN APERTURA"],
             "Ordinamento": [{"Campo": "DataFine", "Tipo": "ASC"}]
         }
         try:
@@ -380,9 +380,9 @@ def import_aria_lombardia():
                 if diff < 0:    stato_db = "scaduta"
                 elif diff <= 7: stato_db = "in_scadenza"
 
+            # Per ARIA inseriamo tutto: APERTO, IN APERTURA
+            # (l'API filtra già per Stato=["APERTO","IN APERTURA"])
             stato_api = (b.get("Stato") or "").upper()
-            if stato_api == "CHIUSO" or stato_db == "scaduta":
-                continue
 
             # Ente
             ente_obj = b.get("EnteResponsabile") or {}
@@ -420,11 +420,79 @@ def import_aria_lombardia():
         if start >= (totale or 0):
             break
 
-    gare = [g for g in gare if g["stato"] in ("attiva","in_scadenza")]
-    print(f"  📊 {len(gare)} bandi attivi/in scadenza")
+    print(f"  📊 {len(gare)} bandi da inserire")
     inserite = insert_batch(gare)
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ARIA_LOMBARDIA","totale":totale,"filtrate":len(gare),"inserite":inserite}
+
+
+# ── Aggiorna stati gare esistenti ─────────────────────────────────────────────
+def aggiorna_stati():
+    """
+    Aggiorna lo stato delle gare già in database in base alla data corrente:
+    - scadenza passata → scaduta
+    - scadenza entro 7 giorni → in_scadenza
+    - scadenza futura → attiva
+    """
+    print("🔄 Aggiornamento stati gare esistenti")
+    oggi = date.today()
+
+    # 1. attiva → scaduta (scadenza già passata)
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/gare",
+        headers={**HEADERS_SB, "Prefer": "return=minimal"},
+        params={
+            "stato":    "eq.attiva",
+            "scadenza": f"lt.{oggi.isoformat()}T00:00:00+00:00",
+        },
+        json={"stato": "scaduta"},
+        timeout=30
+    )
+    print(f"  attiva → scaduta: HTTP {r.status_code}")
+
+    # 2. in_scadenza → scaduta (scadenza già passata)
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/gare",
+        headers={**HEADERS_SB, "Prefer": "return=minimal"},
+        params={
+            "stato":    "eq.in_scadenza",
+            "scadenza": f"lt.{oggi.isoformat()}T00:00:00+00:00",
+        },
+        json={"stato": "scaduta"},
+        timeout=30
+    )
+    print(f"  in_scadenza → scaduta: HTTP {r.status_code}")
+
+    # 3. attiva → in_scadenza (scadenza entro 7 giorni)
+    tra_7gg = (oggi + __import__("datetime").timedelta(days=7)).isoformat()
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/gare",
+        headers={**HEADERS_SB, "Prefer": "return=minimal"},
+        params={
+            "stato":    "eq.attiva",
+            "scadenza": f"gte.{oggi.isoformat()}T00:00:00+00:00",
+            "scadenza": f"lte.{tra_7gg}T23:59:59+00:00",
+        },
+        json={"stato": "in_scadenza"},
+        timeout=30
+    )
+    print(f"  attiva → in_scadenza (entro 7gg): HTTP {r.status_code}")
+
+    # 4. in_scadenza → attiva (scadenza oltre 7 giorni, magari prorogata)
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/gare",
+        headers={**HEADERS_SB, "Prefer": "return=minimal"},
+        params={
+            "stato":    "eq.in_scadenza",
+            "scadenza": f"gt.{tra_7gg}T23:59:59+00:00",
+        },
+        json={"stato": "attiva"},
+        timeout=30
+    )
+    print(f"  in_scadenza → attiva (proroga): HTTP {r.status_code}")
+
+    print("  ✅ Aggiornamento stati completato")
+    return {"aggiornamento_stati": "ok"}
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -438,6 +506,7 @@ if __name__ == "__main__":
 
     risultati.append(import_ted())
     risultati.append(import_aria_lombardia())
+    aggiorna_stati()
 
     tot = sum(r.get("inserite",0) for r in risultati)
     print(f"\n✅ TOTALE: {tot} nuove gare inserite")
