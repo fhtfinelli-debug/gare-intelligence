@@ -273,6 +273,19 @@ def import_ted():
                 pdf_link  = (links.get("pdf") or {}).get("ITA") or None
                 pop       = n.get("place-of-performance") or []
                 provincia = pop[0] if pop else None
+                # Importo — campo estimated-value-lot
+                importo_obj = n.get("estimated-value-lot") or n.get("estimated-value") or {}
+                if isinstance(importo_obj, list) and importo_obj:
+                    importo_obj = importo_obj[0]
+                if isinstance(importo_obj, dict):
+                    importo_val = importo_obj.get("amount") or importo_obj.get("value") or 0
+                elif isinstance(importo_obj, (int, float)):
+                    importo_val = importo_obj
+                else:
+                    importo_val = 0
+                try: importo_val = float(importo_val)
+                except: importo_val = 0
+
                 gare.append({
                     "codice_cig":   None,
                     "titolo":       titolo[:500] if titolo else "(n/d)",
@@ -281,7 +294,8 @@ def import_ted():
                     "regione":      "ITALIA", "provincia": provincia, "comune": None,
                     "categoria_cpv":   cpv[:20] if cpv else None, "categoria_label": None,
                     "procedura":    "Procedura aperta (EU)", "criterio_aggiudicazione": None,
-                    "importo_min":  None, "importo_max": None, "importo_totale": None,
+                    "importo_min":  None, "importo_max": None,
+                    "importo_totale": round(importo_val, 2) if importo_val > 0 else None,
                     "scadenza":     scad or None, "data_pubblicazione": oggi,
                     "stato":        stato_ted, "fonte": "TED_EU",
                     "url_bando":    html_link, "url_portale": pdf_link,
@@ -399,16 +413,42 @@ def import_aria_lombardia():
             if url_bando == url_portale:
                 url_portale = None
 
+            # Chiama dettaglio per info aggiuntive (importo, descrizione estesa)
+            importo_val = None
+            descrizione = b.get("Abstract") or None
+            if codice:
+                try:
+                    rd = requests.get(
+                        f"{BASE_URL}/catalogo/dettaglio/{codice}",
+                        headers=headers_api, timeout=15
+                    )
+                    if rd.status_code == 200:
+                        det = rd.json()
+                        # Importo da DotazioneFinanziaria (stringa) o campo diretto
+                        dot = det.get("DotazioneFinanziaria") or ""
+                        if dot:
+                            dot_clean = dot.replace("€","").replace(".","").replace(",",".").strip()
+                            import re
+                            nums = re.findall(r"[\d]+(?:\.\d+)?", dot_clean.replace(",","."))
+                            if nums:
+                                try: importo_val = float(nums[0])
+                                except: pass
+                        # Descrizione estesa
+                        if det.get("Descrizione"):
+                            descrizione = det["Descrizione"][:1000]
+                except: pass
+
             gare.append({
                 "codice_cig":   None,
                 "titolo":       (b.get("Titolo") or "(n/d)")[:500],
-                "descrizione":  b.get("Abstract") or None,
+                "descrizione":  descrizione,
                 "riassunto_ai": None, "keywords_ai": [], "settore_ai": None,
                 "ente":         ente,
                 "regione":      "LOMBARDIA", "provincia": None, "comune": None,
                 "categoria_cpv":   None, "categoria_label": None,
                 "procedura":    None, "criterio_aggiudicazione": None,
-                "importo_min":  None, "importo_max": None, "importo_totale": None,
+                "importo_min":  None, "importo_max": None,
+                "importo_totale": round(importo_val, 2) if importo_val and importo_val > 0 else None,
                 "scadenza":           scadenza,
                 "data_pubblicazione": data_pub,
                 "stato":        stato_db, "fonte": "ARIA_LOMBARDIA",
