@@ -16,7 +16,7 @@ HEADERS_SB = {
     "apikey":        SERVICE_KEY,
     "Authorization": f"Bearer {SERVICE_KEY}",
     "Content-Type":  "application/json",
-    "Prefer":        "resolution=merge-duplicates,return=minimal",  # FIX: era ignore-duplicates
+    "Prefer":        "resolution=merge-duplicates,return=minimal",
 }
 
 # ── Filtri ANAC ───────────────────────────────────────────────────────────────
@@ -88,7 +88,6 @@ def parse_scad_date(d):
     return None
 
 def epoch_ms_to_iso(ms):
-    """Converte EPOCH millisecondi in stringa ISO"""
     if not ms: return None
     try:
         dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
@@ -140,16 +139,24 @@ def insert_batch(gare):
     return inserite
 
 # ── ANAC: mappa riga CSV ──────────────────────────────────────────────────────
-def riga_to_gara(r):
+def riga_to_gara(r, debug_counters=None):
     importo = parse_importo(r.get("importo_complessivo_gara"))
     if importo == 0: importo = parse_importo(r.get("importo_lotto"))
-    if importo < IMPORTO_MIN: return None
+    if importo < IMPORTO_MIN:
+        if debug_counters is not None: debug_counters["scartate_importo"] += 1
+        return None
     scad_raw = r.get("data_scadenza_offerta","")
     stato    = mappa_stato_anac(r.get("stato",""), scad_raw)
-    if stato not in ("attiva","in_scadenza"): return None
+    if stato not in ("attiva","in_scadenza"):
+        if debug_counters is not None:
+            chiave = f"scartate_stato_{stato or 'None'}"
+            debug_counters[chiave] = debug_counters.get(chiave, 0) + 1
+        return None
     cpv     = r.get("cod_cpv") or ""
     oggetto = r.get("oggetto_gara") or ""
-    if not cpv_ok(cpv) and not kw_ok(oggetto): return None
+    if not cpv_ok(cpv) and not kw_ok(oggetto):
+        if debug_counters is not None: debug_counters["scartate_cpv_kw"] += 1
+        return None
     regione = (r.get("sezione_regionale") or "").replace("SEZIONE REGIONALE ","").strip() or None
     cig     = r.get("cig") or None
     return {
@@ -182,12 +189,26 @@ def processa_csv(raw_bytes):
     gare  = []
     righe = 0
     stati = {}
+
+    # Contatori debug
+    debug = {"scartate_importo": 0, "scartate_cpv_kw": 0}
+
     for row in reader:
         righe += 1
-        g = riga_to_gara(row)
+        g = riga_to_gara(row, debug_counters=debug)
         if g:
             gare.append(g)
             stati[g["stato"]] = stati.get(g["stato"],0) + 1
+
+    # Stampa riepilogo filtri
+    print(f"  🔍 DEBUG filtri ANAC:")
+    print(f"     Scartate per importo < {IMPORTO_MIN}€  : {debug['scartate_importo']}")
+    for k, v in debug.items():
+        if k.startswith("scartate_stato_"):
+            print(f"     Scartate per stato '{k.replace('scartate_stato_','')}' : {v}")
+    print(f"     Scartate per CPV/keyword no match : {debug['scartate_cpv_kw']}")
+    print(f"     ✅ Passate tutti i filtri          : {len(gare)}")
+
     return righe, gare, stati
 
 # ── ANAC delta giornaliero ────────────────────────────────────────────────────
@@ -273,7 +294,6 @@ def import_ted():
                 pdf_link  = (links.get("pdf") or {}).get("ITA") or None
                 pop       = n.get("place-of-performance") or []
                 provincia = pop[0] if pop else None
-                # Importo — campo estimated-value-lot
                 importo_obj = n.get("estimated-value-lot") or n.get("estimated-value") or {}
                 if isinstance(importo_obj, list) and importo_obj:
                     importo_obj = importo_obj[0]
@@ -322,7 +342,6 @@ def import_aria_lombardia():
     BASE_URL  = "https://api.servizirl.it/c/servizi.rl/agora_catalogo/v2.0.0"
     TOKEN_URL = "https://api.servizirl.it/oauth2/token"
 
-    # 1. Ottieni token OAuth2
     credentials = base64.b64encode(f"{ARIA_CLIENT_ID}:{ARIA_CLIENT_SECRET}".encode()).decode()
     try:
         r = requests.post(TOKEN_URL,
@@ -343,12 +362,7 @@ def import_aria_lombardia():
         print(f"  ❌ Errore token: {e}")
         return {"fonte":"ARIA_LOMBARDIA","inserite":0,"errore":str(e)}
 
-    headers_api = {
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    # 2. Scarica bandi con paginazione
+    headers_api = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     gare   = []
     start  = 0
     count  = 100
@@ -356,9 +370,7 @@ def import_aria_lombardia():
     oggi   = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
 
     while True:
-        body = {
-            "Ordinamento": [{"Campo": "DataFine", "Tipo": "ASC"}]
-        }
+        body = {"Ordinamento": [{"Campo": "DataFine", "Tipo": "ASC"}]}
         try:
             r = requests.post(
                 f"{BASE_URL}/catalogo/ricerca?start={start}&count={count}",
@@ -371,44 +383,36 @@ def import_aria_lombardia():
 
         lista    = data.get("Lista") or data.get("lista") or []
         n_totale = data.get("NumeroRisultati") or data.get("numeroRisultati") or 0
-
         if totale is None:
             totale = n_totale
             print(f"  📊 {totale} bandi trovati")
-
         if not lista:
             break
 
         for b in lista:
-            # Date EPOCH ms
             data_fine   = b.get("DataFine")
             data_inizio = b.get("DataInizio")
             scadenza    = epoch_ms_to_iso(data_fine)
             data_pub    = epoch_ms_to_iso(data_inizio) or oggi
             stato_db    = "attiva"
-
-            scad_date = epoch_ms_to_date(data_fine)
+            scad_date   = epoch_ms_to_date(data_fine)
             if scad_date:
                 diff = (scad_date - date.today()).days
                 if diff < 0:    stato_db = "scaduta"
                 elif diff <= 7: stato_db = "in_scadenza"
 
-            # Ente
             ente_obj = b.get("EnteResponsabile") or {}
             if isinstance(ente_obj, dict):
                 ente = ente_obj.get("Descrizione") or ente_obj.get("denominazione") or "Regione Lombardia"
             else:
                 ente = "Regione Lombardia"
 
-            codice    = b.get("Codice") or b.get("ID") or None
-            url_bando = b.get("LinkPiattaforma") or b.get("RefUrl") or None
+            codice      = b.get("Codice") or b.get("ID") or None
+            url_bando   = b.get("LinkPiattaforma") or b.get("RefUrl") or None
             url_portale = b.get("RefUrl") or None
-
-            # Evita url_bando == url_portale (unique constraint)
             if url_bando == url_portale:
                 url_portale = None
 
-            # Chiama dettaglio per info aggiuntive (importo, descrizione estesa)
             importo_val = None
             descrizione = b.get("Abstract") or None
             if codice:
@@ -419,7 +423,6 @@ def import_aria_lombardia():
                     )
                     if rd.status_code == 200:
                         det = rd.json()
-                        # Importo da DotazioneFinanziaria (stringa) o campo diretto
                         dot = det.get("DotazioneFinanziaria") or ""
                         if dot:
                             dot_clean = dot.replace("€","").replace(".","").replace(",",".").strip()
@@ -428,7 +431,6 @@ def import_aria_lombardia():
                             if nums:
                                 try: importo_val = float(nums[0])
                                 except: pass
-                        # Descrizione estesa
                         if det.get("Descrizione"):
                             descrizione = det["Descrizione"][:1000]
                 except: pass
@@ -463,67 +465,36 @@ def import_aria_lombardia():
 
 # ── Aggiorna stati gare esistenti ─────────────────────────────────────────────
 def aggiorna_stati():
-    """
-    Aggiorna lo stato delle gare già in database in base alla data corrente:
-    - scadenza passata → scaduta
-    - scadenza entro 7 giorni → in_scadenza
-    - scadenza futura → attiva
-    """
     print("🔄 Aggiornamento stati gare esistenti")
     oggi = date.today()
 
-    # 1. attiva → scaduta (scadenza già passata)
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/gare",
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/gare",
         headers={**HEADERS_SB, "Prefer": "return=minimal"},
-        params={
-            "stato":    "eq.attiva",
-            "scadenza": f"lt.{oggi.isoformat()}T00:00:00+00:00",
-        },
-        json={"stato": "scaduta"},
-        timeout=30
-    )
+        params={"stato": "eq.attiva", "scadenza": f"lt.{oggi.isoformat()}T00:00:00+00:00"},
+        json={"stato": "scaduta"}, timeout=30)
     print(f"  attiva → scaduta: HTTP {r.status_code}")
 
-    # 2. in_scadenza → scaduta (scadenza già passata)
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/gare",
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/gare",
         headers={**HEADERS_SB, "Prefer": "return=minimal"},
-        params={
-            "stato":    "eq.in_scadenza",
-            "scadenza": f"lt.{oggi.isoformat()}T00:00:00+00:00",
-        },
-        json={"stato": "scaduta"},
-        timeout=30
-    )
+        params={"stato": "eq.in_scadenza", "scadenza": f"lt.{oggi.isoformat()}T00:00:00+00:00"},
+        json={"stato": "scaduta"}, timeout=30)
     print(f"  in_scadenza → scaduta: HTTP {r.status_code}")
 
-    # 3. attiva → in_scadenza (scadenza entro 7 giorni)
     tra_7gg = (oggi + __import__("datetime").timedelta(days=7)).isoformat()
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/gare",
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/gare",
         headers={**HEADERS_SB, "Prefer": "return=minimal"},
         params={
             "stato":    "eq.attiva",
             "scadenza": f"gte.{oggi.isoformat()}T00:00:00+00:00",
             "scadenza": f"lte.{tra_7gg}T23:59:59+00:00",
         },
-        json={"stato": "in_scadenza"},
-        timeout=30
-    )
+        json={"stato": "in_scadenza"}, timeout=30)
     print(f"  attiva → in_scadenza (entro 7gg): HTTP {r.status_code}")
 
-    # 4. in_scadenza → attiva (scadenza oltre 7 giorni, magari prorogata)
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/gare",
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/gare",
         headers={**HEADERS_SB, "Prefer": "return=minimal"},
-        params={
-            "stato":    "eq.in_scadenza",
-            "scadenza": f"gt.{tra_7gg}T23:59:59+00:00",
-        },
-        json={"stato": "attiva"},
-        timeout=30
-    )
+        params={"stato": "eq.in_scadenza", "scadenza": f"gt.{tra_7gg}T23:59:59+00:00"},
+        json={"stato": "attiva"}, timeout=30)
     print(f"  in_scadenza → attiva (proroga): HTTP {r.status_code}")
 
     print("  ✅ Aggiornamento stati completato")
