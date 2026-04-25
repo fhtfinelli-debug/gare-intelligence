@@ -16,7 +16,7 @@ HEADERS_SB = {
     "apikey":        SERVICE_KEY,
     "Authorization": f"Bearer {SERVICE_KEY}",
     "Content-Type":  "application/json",
-    "Prefer":        "resolution=ignore-duplicates,return=minimal",
+    "Prefer":        "resolution=merge-duplicates,return=minimal",  # FIX: era ignore-duplicates
 }
 
 # ── Filtri ANAC ───────────────────────────────────────────────────────────────
@@ -356,7 +356,6 @@ def import_aria_lombardia():
     oggi   = datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
 
     while True:
-        # Nessun filtro Stato — scarica tutti i bandi e filtra localmente
         body = {
             "Ordinamento": [{"Campo": "DataFine", "Tipo": "ASC"}]
         }
@@ -393,10 +392,6 @@ def import_aria_lombardia():
                 diff = (scad_date - date.today()).days
                 if diff < 0:    stato_db = "scaduta"
                 elif diff <= 7: stato_db = "in_scadenza"
-
-            # Per ARIA inseriamo tutto: APERTO, IN APERTURA
-            # (l'API filtra già per Stato=["APERTO","IN APERTURA"])
-            stato_api = (b.get("Stato") or "").upper()
 
             # Ente
             ente_obj = b.get("EnteResponsabile") or {}
