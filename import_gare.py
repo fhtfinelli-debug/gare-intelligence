@@ -122,21 +122,33 @@ def parse_importo(val):
     except: return 0
 
 # ── Insert Supabase ───────────────────────────────────────────────────────────
-def insert_batch(gare):
+def insert_batch(gare, fonte=""):
     inserite = 0
+    errori   = 0
     for i in range(0, len(gare), BATCH_SIZE):
         batch = gare[i:i+BATCH_SIZE]
         r = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
             headers=HEADERS_SB, json=batch, timeout=30)
-        # FIX: merge-duplicates restituisce 204 (no content) — va accettato come successo
         if r.status_code in (200, 201, 204):
             inserite += len(batch)
         else:
-            for gara in batch:
+            # DEBUG: stampa il codice e il messaggio di errore completo
+            print(f"  ⚠️  [{fonte}] Batch {i//BATCH_SIZE+1} errore HTTP {r.status_code}")
+            print(f"      Risposta Supabase: {r.text[:500]}")
+            # Retry gara per gara per isolare il problema
+            for j, gara in enumerate(batch):
                 r2 = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
                     headers=HEADERS_SB, json=[gara], timeout=15)
                 if r2.status_code in (200, 201, 204):
                     inserite += 1
+                else:
+                    errori += 1
+                    # Stampa solo il primo errore singolo per non spammare il log
+                    if errori == 1:
+                        print(f"      Primo errore singolo HTTP {r2.status_code}: {r2.text[:300]}")
+                        print(f"      Gara incriminata: {json.dumps(gara, ensure_ascii=False)[:300]}")
+    if errori > 0:
+        print(f"  ❌ [{fonte}] {errori} gare non inserite per errore Supabase")
     return inserite
 
 # ── ANAC: mappa riga CSV ──────────────────────────────────────────────────────
@@ -190,18 +202,13 @@ def processa_csv(raw_bytes):
     gare  = []
     righe = 0
     stati = {}
-
-    # Contatori debug
     debug = {"scartate_importo": 0, "scartate_cpv_kw": 0}
-
     for row in reader:
         righe += 1
         g = riga_to_gara(row, debug_counters=debug)
         if g:
             gare.append(g)
             stati[g["stato"]] = stati.get(g["stato"],0) + 1
-
-    # Stampa riepilogo filtri
     print(f"  🔍 DEBUG filtri ANAC:")
     print(f"     Scartate per importo < {IMPORTO_MIN}€  : {debug['scartate_importo']}")
     for k, v in debug.items():
@@ -209,7 +216,6 @@ def processa_csv(raw_bytes):
             print(f"     Scartate per stato '{k.replace('scartate_stato_','')}' : {v}")
     print(f"     Scartate per CPV/keyword no match : {debug['scartate_cpv_kw']}")
     print(f"     ✅ Passate tutti i filtri          : {len(gare)}")
-
     return righe, gare, stati
 
 # ── ANAC delta giornaliero ────────────────────────────────────────────────────
@@ -221,7 +227,7 @@ def import_anac_daily():
     print(f"  ✅ CSV delta: {len(r.content)/1e3:.0f} KB")
     righe, gare, stati = processa_csv(r.content)
     print(f"  📊 {righe} righe → {len(gare)} attive/in_scadenza: {stati}")
-    inserite = insert_batch(gare)
+    inserite = insert_batch(gare, "ANAC")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ANAC_DELTA","righe":righe,"filtrate":len(gare),"inserite":inserite}
 
@@ -242,7 +248,7 @@ def import_anac_monthly():
             raw = f.read()
     righe, gare, stati = processa_csv(raw)
     print(f"  📊 {righe} righe → {len(gare)} attive/in_scadenza: {stati}")
-    inserite = insert_batch(gare)
+    inserite = insert_batch(gare, "ANAC")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ANAC_ZIP","url":anac_url,"righe":righe,"filtrate":len(gare),"inserite":inserite}
 
@@ -328,7 +334,7 @@ def import_ted():
             break
 
     print(f"  📊 {len(gare)} gare attive/in_scadenza su {pagina-1} pagine")
-    inserite = insert_batch(gare)
+    inserite = insert_batch(gare, "TED")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"TED_EU","totale":totale,"pagine":pagina-1,"filtrate":len(gare),"inserite":inserite}
 
@@ -459,7 +465,7 @@ def import_aria_lombardia():
             break
 
     print(f"  📊 {len(gare)} bandi da inserire")
-    inserite = insert_batch(gare)
+    inserite = insert_batch(gare, "ARIA")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ARIA_LOMBARDIA","totale":totale,"filtrate":len(gare),"inserite":inserite}
 
