@@ -1,6 +1,11 @@
 name: Test ANAC Nazionale
 on:
   workflow_dispatch:
+    inputs:
+      test_date:
+        description: 'Data da testare (es. 24/04/2026)'
+        required: false
+        default: '24/04/2026'
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -14,3 +19,4 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TEST_DATE: ${{ inputs.test_date }}
