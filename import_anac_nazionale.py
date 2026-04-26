@@ -2,9 +2,14 @@
 import_anac_nazionale.py — ANAC Piattaforma Pubblicità Legale
 https://pubblicitalegale.anticorruzione.it
 
-Endpoint confermato: GET /api/v0/avvisi
+Endpoint: GET /api/v0/avvisi
 Copertura: TUTTA ITALIA — tutti i bandi dal 01/01/2024
 Circa 100-200 bandi/giorno, nessuna autenticazione richiesta.
+
+Fix 2026-04-26:
+- Parsing SEZ. C: usare "SEZ. C" non "C" (Committente contiene C → falso match)
+- url_portale: inserito con fallback — se 409 riprova senza url_portale
+- on_conflict: codice_gara (idAvviso UUID, sempre unico)
 """
 
 import os, requests, time, json
@@ -17,7 +22,7 @@ PAGE_SIZE = 100
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY", "")
-TEST_DATE    = os.environ.get("TEST_DATE", "")  # es. "24/04/2026"
+TEST_DATE    = os.environ.get("TEST_DATE", "")
 
 HEADERS_API = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
@@ -58,7 +63,7 @@ def parse_record(rec):
     # SEZ. A — Ente
     ente = None
     for s in sections:
-        if "A" in s.get("name", ""):
+        if "SEZ. A" in s.get("name", ""):
             soggetti = s.get("fields", {}).get("soggetti_sa", [])
             if soggetti:
                 ente = soggetti[0].get("denominazione_amministrazione")
@@ -67,14 +72,15 @@ def parse_record(rec):
     # SEZ. B — URL documenti
     url_documenti = None
     for s in sections:
-        if "B" in s.get("name", ""):
+        if "SEZ. B" in s.get("name", ""):
             url_documenti = s.get("fields", {}).get("documenti_di_gara_link")
             break
 
-    # SEZ. C — Primo lotto
+    # SEZ. C — Primo lotto (CIG, importo, CPV, luogo, scadenza)
+    # FIX: "SEZ. C" non "C" — "Committente" in SEZ. A contiene la lettera C
     cig = importo_val = cpv = provincia = comune = scadenza_lotto = None
     for s in sections:
-        if "C" in s.get("name", ""):
+        if "SEZ. C" in s.get("name", ""):
             items = s.get("items", [])
             if items:
                 lotto          = items[0]
@@ -133,9 +139,9 @@ def parse_record(rec):
         "stato":        stato,
         "fonte":        "ANAC_NAZIONALE",
         "url_bando":    f"{BASE}/bandi/{id_avviso}?ricercaArchivio=false" if id_avviso else None,
-        "url_portale":  url_documenti,
+        "url_portale":  url_documenti,  # link ai documenti di gara
         "id_sintel":    None,
-        "codice_gara":  id_avviso,
+        "codice_gara":  id_avviso,  # idAvviso UUID — sempre unico
         "rup":          None,
     }
 
@@ -187,21 +193,49 @@ def scarica_bandi(data_it, codice_scheda="2,4"):
     return gare
 
 # ── Insert Supabase ────────────────────────────────────────────────────────────
+def insert_singolo(url, gara):
+    r = requests.post(url, headers=HEADERS_SB, json=[gara], timeout=15)
+    if r.status_code in (200, 201, 204):
+        return True
+    # Se 409 su url_portale, riprova senza — il bando viene salvato con url_bando ANAC
+    if r.status_code == 409 and "url_portale" in r.text:
+        gara_clean = {**gara, "url_portale": None}
+        r2 = requests.post(url, headers=HEADERS_SB, json=[gara_clean], timeout=15)
+        return r2.status_code in (200, 201, 204)
+    return False
+
 def insert_batch(gare):
     inserite = 0
+    doc_persi = 0
     BATCH = 50
     url = f"{SUPABASE_URL}/rest/v1/gare?on_conflict=codice_gara"
+
     for i in range(0, len(gare), BATCH):
         batch = gare[i:i+BATCH]
         r = requests.post(url, headers=HEADERS_SB, json=batch, timeout=30)
         if r.status_code in (200, 201, 204):
             inserite += len(batch)
         else:
-            print(f"  ⚠️  Batch {i//BATCH+1} errore {r.status_code}: {r.text[:100]}")
+            # Retry singolarmente con fallback su url_portale
             for gara in batch:
                 r2 = requests.post(url, headers=HEADERS_SB, json=[gara], timeout=15)
                 if r2.status_code in (200, 201, 204):
                     inserite += 1
+                elif r2.status_code == 409 and "url_portale" in r2.text:
+                    # url_portale già usato da altro record (es. ARIA/TED)
+                    # Salva senza url_portale — url_bando ANAC rimane
+                    gara_clean = {**gara, "url_portale": None}
+                    r3 = requests.post(url, headers=HEADERS_SB, json=[gara_clean], timeout=15)
+                    if r3.status_code in (200, 201, 204):
+                        inserite += 1
+                        doc_persi += 1
+                    else:
+                        print(f"  ❌ Fallita anche senza url_portale: {r3.status_code}")
+                else:
+                    print(f"  ❌ Errore {r2.status_code}: {r2.text[:100]}")
+
+    if doc_persi:
+        print(f"  ℹ️  {doc_persi} bandi salvati senza link documenti (url_portale già in uso)")
     return inserite
 
 # ── Funzione da chiamare da import_gare.py ─────────────────────────────────────
@@ -239,8 +273,6 @@ def import_anac_nazionale(days_back=1):
 if __name__ == "__main__":
     print(f"🚀 Test ANAC Nazionale — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    # TEST_DATE permette di forzare una data specifica (es. "24/04/2026")
-    # Utile perché il 25 aprile è festivo — zero bandi
     if TEST_DATE:
         data_it = TEST_DATE
         print(f"📅 Data forzata (TEST_DATE): {data_it}")
@@ -261,21 +293,23 @@ if __name__ == "__main__":
         print(f"  Con importo:  {sum(1 for g in gare if g['importo_totale'])}/{len(gare)}")
         print(f"  Con scadenza: {sum(1 for g in gare if g['scadenza'])}/{len(gare)}")
         print(f"  Con provincia:{sum(1 for g in gare if g['provincia'])}/{len(gare)}")
+        print(f"  Con documenti:{sum(1 for g in gare if g['url_portale'])}/{len(gare)}")
 
         print(f"\n📋 Primi 5 bandi:")
         for i, g in enumerate(gare[:5], 1):
             print(f"\n  {i}. {g['titolo'][:90]}")
-            print(f"     Ente:     {g['ente']}")
-            print(f"     Importo:  {g['importo_totale']} €")
-            print(f"     CIG:      {g['codice_cig']}")
-            print(f"     Provincia:{g['provincia']}")
-            print(f"     Scadenza: {g['scadenza']}")
+            print(f"     Ente:      {g['ente']}")
+            print(f"     Importo:   {g['importo_totale']} €")
+            print(f"     CIG:       {g['codice_cig']}")
+            print(f"     Provincia: {g['provincia']}")
+            print(f"     Scadenza:  {g['scadenza']}")
+            print(f"     Documenti: {g['url_portale']}")
 
         if SUPABASE_URL and SERVICE_KEY:
             print(f"\n💾 Inserimento reale in Supabase...")
             inserite = insert_batch(gare)
             print(f"✅ {inserite} inserite")
         else:
-            print(f"\n⚠️  DRY-RUN: SUPABASE_URL e SUPABASE_SERVICE_KEY non configurati")
-            print(f"\n   JSON prima gara:")
+            print(f"\n⚠️  DRY-RUN: aggiungi SUPABASE_URL e SUPABASE_SERVICE_KEY per inserire")
+            print(f"\nJSON prima gara:")
             print(json.dumps(gare[0], indent=2, ensure_ascii=False))
