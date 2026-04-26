@@ -6,10 +6,11 @@ Endpoint: GET /api/v0/avvisi
 Copertura: TUTTA ITALIA — tutti i bandi dal 01/01/2024
 Circa 100-200 bandi/giorno, nessuna autenticazione richiesta.
 
-Fix 2026-04-26:
-- Parsing SEZ. C: usare "SEZ. C" non "C" (Committente contiene C → falso match)
-- url_portale: inserito con fallback — se 409 riprova senza url_portale
-- on_conflict: codice_gara (idAvviso UUID, sempre unico)
+Fix 2026-04-26 v3:
+- on_conflict=codice_cig quando CIG presente → evita duplicati con ARIA/TED
+- on_conflict=codice_gara quando CIG null → usa UUID ANAC come chiave
+- Lookup provincia → regione per popolare campo regione
+- url_portale con fallback: se 409 riprova senza
 """
 
 import os, requests, time, json
@@ -42,6 +43,94 @@ HEADERS_SB = {
     "Content-Type":  "application/json",
     "Prefer":        "resolution=merge-duplicates,return=minimal",
 }
+
+# ── Lookup provincia NUTS → regione ───────────────────────────────────────────
+# Mappa le province NUTS (come restituisce ANAC) alle regioni italiane
+PROVINCIA_REGIONE = {
+    # Valle d'Aosta
+    "Aosta": "VALLE D'AOSTA",
+    # Piemonte
+    "Torino": "PIEMONTE", "Vercelli": "PIEMONTE", "Novara": "PIEMONTE",
+    "Cuneo": "PIEMONTE", "Asti": "PIEMONTE", "Alessandria": "PIEMONTE",
+    "Biella": "PIEMONTE", "Verbano-Cusio-Ossola": "PIEMONTE",
+    # Liguria
+    "Genova": "LIGURIA", "Savona": "LIGURIA", "La Spezia": "LIGURIA",
+    "Imperia": "LIGURIA",
+    # Lombardia
+    "Milano": "LOMBARDIA", "Bergamo": "LOMBARDIA", "Brescia": "LOMBARDIA",
+    "Como": "LOMBARDIA", "Cremona": "LOMBARDIA", "Lecco": "LOMBARDIA",
+    "Lodi": "LOMBARDIA", "Mantova": "LOMBARDIA", "Monza e della Brianza": "LOMBARDIA",
+    "Pavia": "LOMBARDIA", "Sondrio": "LOMBARDIA", "Varese": "LOMBARDIA",
+    # Trentino-Alto Adige
+    "Trento": "TRENTINO-ALTO ADIGE", "Bolzano": "TRENTINO-ALTO ADIGE",
+    "Bozen": "TRENTINO-ALTO ADIGE",
+    # Veneto
+    "Venezia": "VENETO", "Verona": "VENETO", "Vicenza": "VENETO",
+    "Padova": "VENETO", "Treviso": "VENETO", "Rovigo": "VENETO",
+    "Belluno": "VENETO",
+    # Friuli-Venezia Giulia
+    "Trieste": "FRIULI-VENEZIA GIULIA", "Udine": "FRIULI-VENEZIA GIULIA",
+    "Pordenone": "FRIULI-VENEZIA GIULIA", "Gorizia": "FRIULI-VENEZIA GIULIA",
+    # Emilia-Romagna
+    "Bologna": "EMILIA-ROMAGNA", "Modena": "EMILIA-ROMAGNA",
+    "Ferrara": "EMILIA-ROMAGNA", "Ravenna": "EMILIA-ROMAGNA",
+    "Forlì-Cesena": "EMILIA-ROMAGNA", "Rimini": "EMILIA-ROMAGNA",
+    "Parma": "EMILIA-ROMAGNA", "Piacenza": "EMILIA-ROMAGNA",
+    "Reggio nell'Emilia": "EMILIA-ROMAGNA", "Reggio Emilia": "EMILIA-ROMAGNA",
+    # Toscana
+    "Firenze": "TOSCANA", "Pisa": "TOSCANA", "Siena": "TOSCANA",
+    "Arezzo": "TOSCANA", "Grosseto": "TOSCANA", "Livorno": "TOSCANA",
+    "Lucca": "TOSCANA", "Massa-Carrara": "TOSCANA", "Pistoia": "TOSCANA",
+    "Prato": "TOSCANA",
+    # Umbria
+    "Perugia": "UMBRIA", "Terni": "UMBRIA",
+    # Marche
+    "Ancona": "MARCHE", "Pesaro e Urbino": "MARCHE", "Macerata": "MARCHE",
+    "Ascoli Piceno": "MARCHE", "Fermo": "MARCHE",
+    # Lazio
+    "Roma": "LAZIO", "Latina": "LAZIO", "Frosinone": "LAZIO",
+    "Viterbo": "LAZIO", "Rieti": "LAZIO",
+    # Abruzzo
+    "L'Aquila": "ABRUZZO", "Pescara": "ABRUZZO", "Chieti": "ABRUZZO",
+    "Teramo": "ABRUZZO",
+    # Molise
+    "Campobasso": "MOLISE", "Isernia": "MOLISE",
+    # Campania
+    "Napoli": "CAMPANIA", "Salerno": "CAMPANIA", "Caserta": "CAMPANIA",
+    "Avellino": "CAMPANIA", "Benevento": "CAMPANIA",
+    # Puglia
+    "Bari": "PUGLIA", "Lecce": "PUGLIA", "Taranto": "PUGLIA",
+    "Brindisi": "PUGLIA", "Foggia": "PUGLIA",
+    "Barletta-Andria-Trani": "PUGLIA",
+    # Basilicata
+    "Potenza": "BASILICATA", "Matera": "BASILICATA",
+    # Calabria
+    "Reggio di Calabria": "CALABRIA", "Reggio Calabria": "CALABRIA",
+    "Catanzaro": "CALABRIA", "Cosenza": "CALABRIA",
+    "Crotone": "CALABRIA", "Vibo Valentia": "CALABRIA",
+    # Sicilia
+    "Palermo": "SICILIA", "Catania": "SICILIA", "Messina": "SICILIA",
+    "Agrigento": "SICILIA", "Caltanissetta": "SICILIA", "Enna": "SICILIA",
+    "Ragusa": "SICILIA", "Siracusa": "SICILIA", "Trapani": "SICILIA",
+    # Sardegna
+    "Cagliari": "SARDEGNA", "Sassari": "SARDEGNA", "Nuoro": "SARDEGNA",
+    "Oristano": "SARDEGNA", "Sud Sardegna": "SARDEGNA",
+    "Sassari": "SARDEGNA", "Olbia-Tempio": "SARDEGNA",
+}
+
+def provincia_to_regione(provincia):
+    if not provincia:
+        return None
+    # Cerca corrispondenza diretta
+    r = PROVINCIA_REGIONE.get(provincia)
+    if r:
+        return r
+    # Cerca corrispondenza parziale
+    prov_lower = provincia.lower()
+    for k, v in PROVINCIA_REGIONE.items():
+        if k.lower() in prov_lower or prov_lower in k.lower():
+            return v
+    return None
 
 # ── Parser record ──────────────────────────────────────────────────────────────
 def parse_record(rec):
@@ -76,8 +165,7 @@ def parse_record(rec):
             url_documenti = s.get("fields", {}).get("documenti_di_gara_link")
             break
 
-    # SEZ. C — Primo lotto (CIG, importo, CPV, luogo, scadenza)
-    # FIX: "SEZ. C" non "C" — "Committente" in SEZ. A contiene la lettera C
+    # SEZ. C — Primo lotto
     cig = importo_val = cpv = provincia = comune = scadenza_lotto = None
     for s in sections:
         if "SEZ. C" in s.get("name", ""):
@@ -98,6 +186,9 @@ def parse_record(rec):
                     except:
                         pass
             break
+
+    # Regione dalla provincia
+    regione = provincia_to_regione(provincia)
 
     # Normalizza scadenza
     scad_iso = scadenza_lotto or data_scad or None
@@ -124,7 +215,7 @@ def parse_record(rec):
         "keywords_ai":  [],
         "settore_ai":   None,
         "ente":         ente,
-        "regione":      None,
+        "regione":      regione,
         "provincia":    provincia,
         "comune":       comune,
         "categoria_cpv":   None,
@@ -139,9 +230,9 @@ def parse_record(rec):
         "stato":        stato,
         "fonte":        "ANAC_NAZIONALE",
         "url_bando":    f"{BASE}/bandi/{id_avviso}?ricercaArchivio=false" if id_avviso else None,
-        "url_portale":  url_documenti,  # link ai documenti di gara
+        "url_portale":  url_documenti,
         "id_sintel":    None,
-        "codice_gara":  id_avviso,  # idAvviso UUID — sempre unico
+        "codice_gara":  id_avviso,
         "rup":          None,
     }
 
@@ -192,50 +283,85 @@ def scarica_bandi(data_it, codice_scheda="2,4"):
 
     return gare
 
-# ── Insert Supabase ────────────────────────────────────────────────────────────
-def insert_singolo(url, gara):
+# ── Insert Supabase con deduplicazione intelligente ───────────────────────────
+def insert_singolo(gara):
+    """
+    Inserisce una singola gara con logica di deduplicazione:
+    - Se ha CIG: on_conflict=codice_cig → aggiorna record esistente da ARIA/TED
+    - Se non ha CIG: on_conflict=codice_gara → usa UUID ANAC come chiave
+    - Se 409 su url_portale: riprova senza url_portale
+    """
+    # Sceglie la chiave di conflict in base alla presenza del CIG
+    if gara.get("codice_cig"):
+        conflict_col = "codice_cig"
+    else:
+        conflict_col = "codice_gara"
+
+    url = f"{SUPABASE_URL}/rest/v1/gare?on_conflict={conflict_col}"
+
     r = requests.post(url, headers=HEADERS_SB, json=[gara], timeout=15)
     if r.status_code in (200, 201, 204):
-        return True
-    # Se 409 su url_portale, riprova senza — il bando viene salvato con url_bando ANAC
+        return True, False  # (inserita, doc_perso)
+
+    # Se 409 su url_portale, riprova senza
     if r.status_code == 409 and "url_portale" in r.text:
         gara_clean = {**gara, "url_portale": None}
         r2 = requests.post(url, headers=HEADERS_SB, json=[gara_clean], timeout=15)
-        return r2.status_code in (200, 201, 204)
-    return False
+        if r2.status_code in (200, 201, 204):
+            return True, True  # (inserita, doc_perso)
+
+    print(f"  ❌ Errore {r.status_code}: {r.text[:100]}")
+    return False, False
 
 def insert_batch(gare):
-    inserite = 0
+    """
+    Prima tenta batch per CIG (bandi con CIG) e batch per codice_gara (senza CIG).
+    Se un batch fallisce, ritorna al singolo con fallback.
+    """
+    inserite  = 0
     doc_persi = 0
-    BATCH = 50
-    url = f"{SUPABASE_URL}/rest/v1/gare?on_conflict=codice_gara"
+    BATCH     = 50
 
-    for i in range(0, len(gare), BATCH):
-        batch = gare[i:i+BATCH]
+    # Separa bandi con CIG da bandi senza CIG
+    con_cig    = [g for g in gare if g.get("codice_cig")]
+    senza_cig  = [g for g in gare if not g.get("codice_cig")]
+
+    print(f"  📋 {len(con_cig)} bandi con CIG, {len(senza_cig)} senza CIG")
+
+    # Inserisci batch con CIG
+    for i in range(0, len(con_cig), BATCH):
+        batch = con_cig[i:i+BATCH]
+        url   = f"{SUPABASE_URL}/rest/v1/gare?on_conflict=codice_cig"
         r = requests.post(url, headers=HEADERS_SB, json=batch, timeout=30)
         if r.status_code in (200, 201, 204):
             inserite += len(batch)
         else:
-            # Retry singolarmente con fallback su url_portale
-            for gara in batch:
-                r2 = requests.post(url, headers=HEADERS_SB, json=[gara], timeout=15)
-                if r2.status_code in (200, 201, 204):
+            # Retry singolo con fallback
+            for g in batch:
+                ok, dp = insert_singolo(g)
+                if ok:
                     inserite += 1
-                elif r2.status_code == 409 and "url_portale" in r2.text:
-                    # url_portale già usato da altro record (es. ARIA/TED)
-                    # Salva senza url_portale — url_bando ANAC rimane
-                    gara_clean = {**gara, "url_portale": None}
-                    r3 = requests.post(url, headers=HEADERS_SB, json=[gara_clean], timeout=15)
-                    if r3.status_code in (200, 201, 204):
-                        inserite += 1
-                        doc_persi += 1
-                    else:
-                        print(f"  ❌ Fallita anche senza url_portale: {r3.status_code}")
-                else:
-                    print(f"  ❌ Errore {r2.status_code}: {r2.text[:100]}")
+                if dp:
+                    doc_persi += 1
+
+    # Inserisci batch senza CIG
+    for i in range(0, len(senza_cig), BATCH):
+        batch = senza_cig[i:i+BATCH]
+        url   = f"{SUPABASE_URL}/rest/v1/gare?on_conflict=codice_gara"
+        r = requests.post(url, headers=HEADERS_SB, json=batch, timeout=30)
+        if r.status_code in (200, 201, 204):
+            inserite += len(batch)
+        else:
+            for g in batch:
+                ok, dp = insert_singolo(g)
+                if ok:
+                    inserite += 1
+                if dp:
+                    doc_persi += 1
 
     if doc_persi:
         print(f"  ℹ️  {doc_persi} bandi salvati senza link documenti (url_portale già in uso)")
+
     return inserite
 
 # ── Funzione da chiamare da import_gare.py ─────────────────────────────────────
@@ -293,6 +419,7 @@ if __name__ == "__main__":
         print(f"  Con importo:  {sum(1 for g in gare if g['importo_totale'])}/{len(gare)}")
         print(f"  Con scadenza: {sum(1 for g in gare if g['scadenza'])}/{len(gare)}")
         print(f"  Con provincia:{sum(1 for g in gare if g['provincia'])}/{len(gare)}")
+        print(f"  Con regione:  {sum(1 for g in gare if g['regione'])}/{len(gare)}")
         print(f"  Con documenti:{sum(1 for g in gare if g['url_portale'])}/{len(gare)}")
 
         print(f"\n📋 Primi 5 bandi:")
@@ -302,6 +429,7 @@ if __name__ == "__main__":
             print(f"     Importo:   {g['importo_totale']} €")
             print(f"     CIG:       {g['codice_cig']}")
             print(f"     Provincia: {g['provincia']}")
+            print(f"     Regione:   {g['regione']}")
             print(f"     Scadenza:  {g['scadenza']}")
             print(f"     Documenti: {g['url_portale']}")
 
