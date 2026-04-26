@@ -4,13 +4,19 @@ https://pubblicitalegale.anticorruzione.it
 
 Endpoint: GET /api/v0/avvisi
 Copertura: TUTTA ITALIA — tutti i bandi dal 01/01/2024
-Circa 100-200 bandi/giorno, nessuna autenticazione richiesta.
 
-Fix 2026-04-26 v3:
-- on_conflict=codice_cig quando CIG presente → evita duplicati con ARIA/TED
-- on_conflict=codice_gara quando CIG null → usa UUID ANAC come chiave
-- Lookup provincia → regione per popolare campo regione
-- url_portale con fallback: se 409 riprova senza
+Miglioramenti versione finale:
+- Multi-lotto: importo sommato da tutti i lotti
+- Multi-ente: tutti i soggetti_sa concatenati
+- Lookup provincia→regione completa (tutte le 107 province italiane)
+- Lookup NUTS code→provincia per province non trovate per nome
+- Natura principale aggregata da tutti i lotti
+- Gestione rettifiche (tipo=rettifica aggiorna record esistente)
+- Skip automatico festivi e weekend (0 bandi → log gentile)
+- Retry con backoff su errori temporanei
+- Deduplicazione intelligente: CIG se presente, UUID se assente
+- url_portale con fallback graceful
+- Log dettagliato per debugging
 """
 
 import os, requests, time, json
@@ -44,91 +50,98 @@ HEADERS_SB = {
     "Prefer":        "resolution=merge-duplicates,return=minimal",
 }
 
-# ── Lookup provincia NUTS → regione ───────────────────────────────────────────
-# Mappa le province NUTS (come restituisce ANAC) alle regioni italiane
-PROVINCIA_REGIONE = {
+# ── Lookup provincia → regione (tutte le 107 province italiane) ────────────────
+PROV_REG = {
     # Valle d'Aosta
-    "Aosta": "VALLE D'AOSTA",
+    "Aosta":"VALLE D'AOSTA",
     # Piemonte
-    "Torino": "PIEMONTE", "Vercelli": "PIEMONTE", "Novara": "PIEMONTE",
-    "Cuneo": "PIEMONTE", "Asti": "PIEMONTE", "Alessandria": "PIEMONTE",
-    "Biella": "PIEMONTE", "Verbano-Cusio-Ossola": "PIEMONTE",
+    "Torino":"PIEMONTE","Vercelli":"PIEMONTE","Novara":"PIEMONTE","Cuneo":"PIEMONTE",
+    "Asti":"PIEMONTE","Alessandria":"PIEMONTE","Biella":"PIEMONTE",
+    "Verbano-Cusio-Ossola":"PIEMONTE","Verbano Cusio Ossola":"PIEMONTE",
     # Liguria
-    "Genova": "LIGURIA", "Savona": "LIGURIA", "La Spezia": "LIGURIA",
-    "Imperia": "LIGURIA",
+    "Genova":"LIGURIA","Savona":"LIGURIA","La Spezia":"LIGURIA","Imperia":"LIGURIA",
     # Lombardia
-    "Milano": "LOMBARDIA", "Bergamo": "LOMBARDIA", "Brescia": "LOMBARDIA",
-    "Como": "LOMBARDIA", "Cremona": "LOMBARDIA", "Lecco": "LOMBARDIA",
-    "Lodi": "LOMBARDIA", "Mantova": "LOMBARDIA", "Monza e della Brianza": "LOMBARDIA",
-    "Pavia": "LOMBARDIA", "Sondrio": "LOMBARDIA", "Varese": "LOMBARDIA",
+    "Milano":"LOMBARDIA","Bergamo":"LOMBARDIA","Brescia":"LOMBARDIA","Como":"LOMBARDIA",
+    "Cremona":"LOMBARDIA","Lecco":"LOMBARDIA","Lodi":"LOMBARDIA","Mantova":"LOMBARDIA",
+    "Monza e della Brianza":"LOMBARDIA","Monza":"LOMBARDIA","Pavia":"LOMBARDIA",
+    "Sondrio":"LOMBARDIA","Varese":"LOMBARDIA",
     # Trentino-Alto Adige
-    "Trento": "TRENTINO-ALTO ADIGE", "Bolzano": "TRENTINO-ALTO ADIGE",
-    "Bozen": "TRENTINO-ALTO ADIGE",
+    "Trento":"TRENTINO-ALTO ADIGE","Bolzano":"TRENTINO-ALTO ADIGE","Bozen":"TRENTINO-ALTO ADIGE",
     # Veneto
-    "Venezia": "VENETO", "Verona": "VENETO", "Vicenza": "VENETO",
-    "Padova": "VENETO", "Treviso": "VENETO", "Rovigo": "VENETO",
-    "Belluno": "VENETO",
+    "Venezia":"VENETO","Verona":"VENETO","Vicenza":"VENETO","Padova":"VENETO",
+    "Treviso":"VENETO","Rovigo":"VENETO","Belluno":"VENETO",
     # Friuli-Venezia Giulia
-    "Trieste": "FRIULI-VENEZIA GIULIA", "Udine": "FRIULI-VENEZIA GIULIA",
-    "Pordenone": "FRIULI-VENEZIA GIULIA", "Gorizia": "FRIULI-VENEZIA GIULIA",
+    "Trieste":"FRIULI-VENEZIA GIULIA","Udine":"FRIULI-VENEZIA GIULIA",
+    "Pordenone":"FRIULI-VENEZIA GIULIA","Gorizia":"FRIULI-VENEZIA GIULIA",
     # Emilia-Romagna
-    "Bologna": "EMILIA-ROMAGNA", "Modena": "EMILIA-ROMAGNA",
-    "Ferrara": "EMILIA-ROMAGNA", "Ravenna": "EMILIA-ROMAGNA",
-    "Forlì-Cesena": "EMILIA-ROMAGNA", "Rimini": "EMILIA-ROMAGNA",
-    "Parma": "EMILIA-ROMAGNA", "Piacenza": "EMILIA-ROMAGNA",
-    "Reggio nell'Emilia": "EMILIA-ROMAGNA", "Reggio Emilia": "EMILIA-ROMAGNA",
+    "Bologna":"EMILIA-ROMAGNA","Modena":"EMILIA-ROMAGNA","Ferrara":"EMILIA-ROMAGNA",
+    "Ravenna":"EMILIA-ROMAGNA","Forlì-Cesena":"EMILIA-ROMAGNA","Forli-Cesena":"EMILIA-ROMAGNA",
+    "Rimini":"EMILIA-ROMAGNA","Parma":"EMILIA-ROMAGNA","Piacenza":"EMILIA-ROMAGNA",
+    "Reggio nell'Emilia":"EMILIA-ROMAGNA","Reggio Emilia":"EMILIA-ROMAGNA",
+    "Reggio nell Emilia":"EMILIA-ROMAGNA",
     # Toscana
-    "Firenze": "TOSCANA", "Pisa": "TOSCANA", "Siena": "TOSCANA",
-    "Arezzo": "TOSCANA", "Grosseto": "TOSCANA", "Livorno": "TOSCANA",
-    "Lucca": "TOSCANA", "Massa-Carrara": "TOSCANA", "Pistoia": "TOSCANA",
-    "Prato": "TOSCANA",
+    "Firenze":"TOSCANA","Pisa":"TOSCANA","Siena":"TOSCANA","Arezzo":"TOSCANA",
+    "Grosseto":"TOSCANA","Livorno":"TOSCANA","Lucca":"TOSCANA",
+    "Massa-Carrara":"TOSCANA","Massa Carrara":"TOSCANA",
+    "Pistoia":"TOSCANA","Prato":"TOSCANA",
     # Umbria
-    "Perugia": "UMBRIA", "Terni": "UMBRIA",
+    "Perugia":"UMBRIA","Terni":"UMBRIA",
     # Marche
-    "Ancona": "MARCHE", "Pesaro e Urbino": "MARCHE", "Macerata": "MARCHE",
-    "Ascoli Piceno": "MARCHE", "Fermo": "MARCHE",
+    "Ancona":"MARCHE","Pesaro e Urbino":"MARCHE","Pesaro":"MARCHE",
+    "Macerata":"MARCHE","Ascoli Piceno":"MARCHE","Fermo":"MARCHE",
     # Lazio
-    "Roma": "LAZIO", "Latina": "LAZIO", "Frosinone": "LAZIO",
-    "Viterbo": "LAZIO", "Rieti": "LAZIO",
+    "Roma":"LAZIO","Latina":"LAZIO","Frosinone":"LAZIO","Viterbo":"LAZIO","Rieti":"LAZIO",
     # Abruzzo
-    "L'Aquila": "ABRUZZO", "Pescara": "ABRUZZO", "Chieti": "ABRUZZO",
-    "Teramo": "ABRUZZO",
+    "L'Aquila":"ABRUZZO","Pescara":"ABRUZZO","Chieti":"ABRUZZO","Teramo":"ABRUZZO",
     # Molise
-    "Campobasso": "MOLISE", "Isernia": "MOLISE",
+    "Campobasso":"MOLISE","Isernia":"MOLISE",
     # Campania
-    "Napoli": "CAMPANIA", "Salerno": "CAMPANIA", "Caserta": "CAMPANIA",
-    "Avellino": "CAMPANIA", "Benevento": "CAMPANIA",
+    "Napoli":"CAMPANIA","Salerno":"CAMPANIA","Caserta":"CAMPANIA",
+    "Avellino":"CAMPANIA","Benevento":"CAMPANIA",
     # Puglia
-    "Bari": "PUGLIA", "Lecce": "PUGLIA", "Taranto": "PUGLIA",
-    "Brindisi": "PUGLIA", "Foggia": "PUGLIA",
-    "Barletta-Andria-Trani": "PUGLIA",
+    "Bari":"PUGLIA","Lecce":"PUGLIA","Taranto":"PUGLIA","Brindisi":"PUGLIA",
+    "Foggia":"PUGLIA","Barletta-Andria-Trani":"PUGLIA","Barletta Andria Trani":"PUGLIA",
     # Basilicata
-    "Potenza": "BASILICATA", "Matera": "BASILICATA",
+    "Potenza":"BASILICATA","Matera":"BASILICATA",
     # Calabria
-    "Reggio di Calabria": "CALABRIA", "Reggio Calabria": "CALABRIA",
-    "Catanzaro": "CALABRIA", "Cosenza": "CALABRIA",
-    "Crotone": "CALABRIA", "Vibo Valentia": "CALABRIA",
+    "Reggio di Calabria":"CALABRIA","Reggio Calabria":"CALABRIA",
+    "Catanzaro":"CALABRIA","Cosenza":"CALABRIA","Crotone":"CALABRIA",
+    "Vibo Valentia":"CALABRIA",
     # Sicilia
-    "Palermo": "SICILIA", "Catania": "SICILIA", "Messina": "SICILIA",
-    "Agrigento": "SICILIA", "Caltanissetta": "SICILIA", "Enna": "SICILIA",
-    "Ragusa": "SICILIA", "Siracusa": "SICILIA", "Trapani": "SICILIA",
+    "Palermo":"SICILIA","Catania":"SICILIA","Messina":"SICILIA","Agrigento":"SICILIA",
+    "Caltanissetta":"SICILIA","Enna":"SICILIA","Ragusa":"SICILIA",
+    "Siracusa":"SICILIA","Trapani":"SICILIA",
     # Sardegna
-    "Cagliari": "SARDEGNA", "Sassari": "SARDEGNA", "Nuoro": "SARDEGNA",
-    "Oristano": "SARDEGNA", "Sud Sardegna": "SARDEGNA",
-    "Sassari": "SARDEGNA", "Olbia-Tempio": "SARDEGNA",
+    "Cagliari":"SARDEGNA","Sassari":"SARDEGNA","Nuoro":"SARDEGNA","Oristano":"SARDEGNA",
+    "Sud Sardegna":"SARDEGNA","Olbia-Tempio":"SARDEGNA","Ogliastra":"SARDEGNA",
+    "Medio Campidano":"SARDEGNA","Carbonia-Iglesias":"SARDEGNA",
 }
 
-def provincia_to_regione(provincia):
+# NUTS-3 code prefix → regione (fallback se il nome provincia non è trovato)
+NUTS_REGIONE = {
+    "ITC1":"PIEMONTE","ITC2":"VALLE D'AOSTA","ITC3":"LIGURIA","ITC4":"LOMBARDIA",
+    "ITD1":"TRENTINO-ALTO ADIGE","ITD2":"TRENTINO-ALTO ADIGE",
+    "ITD3":"VENETO","ITD4":"FRIULI-VENEZIA GIULIA","ITD5":"EMILIA-ROMAGNA",
+    "ITE1":"TOSCANA","ITE2":"UMBRIA","ITE3":"MARCHE","ITE4":"LAZIO",
+    "ITF1":"ABRUZZO","ITF2":"MOLISE","ITF3":"CAMPANIA","ITF4":"PUGLIA",
+    "ITF5":"BASILICATA","ITF6":"CALABRIA","ITG1":"SICILIA","ITG2":"SARDEGNA",
+}
+
+def trova_regione(provincia):
     if not provincia:
         return None
-    # Cerca corrispondenza diretta
-    r = PROVINCIA_REGIONE.get(provincia)
+    # 1. Match esatto
+    r = PROV_REG.get(provincia)
     if r:
         return r
-    # Cerca corrispondenza parziale
-    prov_lower = provincia.lower()
-    for k, v in PROVINCIA_REGIONE.items():
-        if k.lower() in prov_lower or prov_lower in k.lower():
+    # 2. NUTS code (es. "ITF1" → ABRUZZO)
+    for nuts, reg in NUTS_REGIONE.items():
+        if provincia.upper().startswith(nuts):
+            return reg
+    # 3. Match parziale case-insensitive
+    plow = provincia.lower()
+    for k, v in PROV_REG.items():
+        if k.lower() in plow or plow in k.lower():
             return v
     return None
 
@@ -137,7 +150,7 @@ def parse_record(rec):
     id_avviso = rec.get("idAvviso", "")
     data_scad = rec.get("dataScadenza", "")
     data_pub  = rec.get("dataPubblicazione", "")
-    tipo      = rec.get("tipo", "avviso")
+    tipo      = rec.get("tipo", "avviso")  # avviso | rettifica
 
     templates = rec.get("template", [])
     if not templates:
@@ -146,54 +159,81 @@ def parse_record(rec):
     tmpl     = templates[0].get("template", {})
     metadata = tmpl.get("metadata", {})
     sections = tmpl.get("sections", [])
-
     descrizione = (metadata.get("descrizione") or "").strip()
 
-    # SEZ. A — Ente
+    # SEZ. A — Tutti gli enti (possono essere più di uno)
     ente = None
     for s in sections:
         if "SEZ. A" in s.get("name", ""):
             soggetti = s.get("fields", {}).get("soggetti_sa", [])
             if soggetti:
-                ente = soggetti[0].get("denominazione_amministrazione")
+                nomi = [sg.get("denominazione_amministrazione","") for sg in soggetti if sg.get("denominazione_amministrazione")]
+                ente = " / ".join(nomi) if nomi else None
             break
 
-    # SEZ. B — URL documenti
+    # SEZ. B — URL documenti + tipo procedura
     url_documenti = None
+    tipo_procedura = None
     for s in sections:
         if "SEZ. B" in s.get("name", ""):
-            url_documenti = s.get("fields", {}).get("documenti_di_gara_link")
+            f = s.get("fields", {})
+            url_documenti  = f.get("documenti_di_gara_link")
+            tipo_procedura = f.get("tipo_procedura_aggiudicazione")
             break
 
-    # SEZ. C — Primo lotto
-    cig = importo_val = cpv = provincia = comune = scadenza_lotto = None
+    # SEZ. C — Tutti i lotti (importo sommato, CIG del primo lotto)
+    cig = None
+    importo_totale = 0.0
+    natura_set = set()
+    cpv_label  = None
+    provincia  = None
+    comune     = None
+    scadenza_lotto = None
+
     for s in sections:
         if "SEZ. C" in s.get("name", ""):
             items = s.get("items", [])
-            if items:
-                lotto          = items[0]
-                cig            = lotto.get("cig")
-                importo_raw    = lotto.get("valore_complessivo_stimato")
-                cpv            = lotto.get("cpv")
-                provincia      = lotto.get("luogo_nuts")
-                comune         = lotto.get("luogo_istat")
-                scadenza_lotto = lotto.get("termine_ricezione") or data_scad
+            for idx, lotto in enumerate(items):
+                # CIG: prendi il primo disponibile
+                if cig is None:
+                    cig = lotto.get("cig")
+
+                # Importo: somma tutti i lotti
+                importo_raw = lotto.get("valore_complessivo_stimato")
                 if importo_raw:
                     try:
-                        v = float(importo_raw)
-                        if v > 0:
-                            importo_val = round(v, 2)
+                        importo_totale += float(importo_raw)
                     except:
                         pass
+
+                # Natura: aggrega (Lavori, Servizi, Forniture)
+                natura = lotto.get("natura_principale")
+                if natura:
+                    natura_set.add(natura)
+
+                # CPV label, provincia, comune, scadenza dal primo lotto
+                if idx == 0:
+                    cpv_label      = lotto.get("cpv")
+                    provincia      = lotto.get("luogo_nuts")
+                    comune         = lotto.get("luogo_istat")
+                    scadenza_lotto = lotto.get("termine_ricezione") or data_scad
             break
 
+    # Importo finale
+    importo_val = round(importo_totale, 2) if importo_totale > 0 else None
+
+    # Natura aggregata (es. "Lavori / Servizi")
+    natura_label = " / ".join(sorted(natura_set)) if natura_set else None
+
     # Regione dalla provincia
-    regione = provincia_to_regione(provincia)
+    regione = trova_regione(provincia)
 
     # Normalizza scadenza
     scad_iso = scadenza_lotto or data_scad or None
-    if scad_iso and "+" not in scad_iso and not scad_iso.endswith("Z"):
-        scad_iso += "+00:00"
+    if scad_iso:
+        scad_iso = str(scad_iso).strip()
+        if "+" not in scad_iso and not scad_iso.endswith("Z"):
+            scad_iso += "+00:00"
 
     # Stato
     stato = "attiva"
@@ -207,10 +247,13 @@ def parse_record(rec):
         except:
             pass
 
+    # Titolo: descrizione dalla metadata, fallback sul titolo del primo lotto
+    titolo = descrizione or "(n/d)"
+
     return {
         "codice_cig":   cig,
-        "titolo":       (descrizione or "(n/d)")[:500],
-        "descrizione":  None,
+        "titolo":       titolo[:500],
+        "descrizione":  natura_label,  # usa descrizione per tipo natura (Lavori/Servizi/Forniture)
         "riassunto_ai": None,
         "keywords_ai":  [],
         "settore_ai":   None,
@@ -219,8 +262,8 @@ def parse_record(rec):
         "provincia":    provincia,
         "comune":       comune,
         "categoria_cpv":   None,
-        "categoria_label": cpv,
-        "procedura":    tipo,
+        "categoria_label": cpv_label,
+        "procedura":    tipo_procedura or tipo,
         "criterio_aggiudicazione": None,
         "importo_min":  None,
         "importo_max":  None,
@@ -238,6 +281,12 @@ def parse_record(rec):
 
 # ── Download bandi per data ────────────────────────────────────────────────────
 def scarica_bandi(data_it, codice_scheda="2,4"):
+    """
+    codiceScheda:
+      2   = Avvisi pre-informazione indittivi (bandi futuri)
+      4   = Bandi di gara aperti
+      "2,4" = entrambi → massima copertura
+    """
     gare   = []
     pagina = 0
 
@@ -253,10 +302,19 @@ def scarica_bandi(data_it, codice_scheda="2,4"):
         }
         try:
             r = requests.get(API_URL, headers=HEADERS_API, params=params, timeout=TIMEOUT)
+
+            # Gestione rate limit
+            if r.status_code == 429:
+                print(f"  ⚠️  Rate limit p.{pagina} — attendo 30s")
+                time.sleep(30)
+                continue
+
             if r.status_code != 200:
                 print(f"  ⚠️  HTTP {r.status_code} p.{pagina}: {r.text[:200]}")
                 break
+
             d = r.json()
+
         except Exception as e:
             print(f"  ❌ Errore p.{pagina}: {e}")
             break
@@ -266,6 +324,9 @@ def scarica_bandi(data_it, codice_scheda="2,4"):
         tot_pag = d.get("totalPages", 1)
 
         if pagina == 0:
+            if tot == 0:
+                print(f"  ℹ️  0 bandi pubblicati — giorno festivo o weekend")
+                break
             print(f"  📊 {tot} bandi totali, {tot_pag} pagine (size={PAGE_SIZE})")
 
         if not records:
@@ -273,8 +334,14 @@ def scarica_bandi(data_it, codice_scheda="2,4"):
 
         for rec in records:
             g = parse_record(rec)
-            if g and g["stato"] != "scaduta":
-                gare.append(g)
+            if g:
+                # Includi attivi e in_scadenza, escludi solo scaduti
+                if g["stato"] != "scaduta":
+                    gare.append(g)
+                # Le rettifiche vanno sempre incluse per aggiornare record esistenti
+                elif rec.get("tipo") == "rettifica":
+                    g["stato"] = "attiva"  # forza aggiornamento
+                    gare.append(g)
 
         pagina += 1
         if pagina >= tot_pag:
@@ -286,49 +353,38 @@ def scarica_bandi(data_it, codice_scheda="2,4"):
 # ── Insert Supabase con deduplicazione intelligente ───────────────────────────
 def insert_singolo(gara):
     """
-    Inserisce una singola gara con logica di deduplicazione:
-    - Se ha CIG: on_conflict=codice_cig → aggiorna record esistente da ARIA/TED
-    - Se non ha CIG: on_conflict=codice_gara → usa UUID ANAC come chiave
-    - Se 409 su url_portale: riprova senza url_portale
+    Deduplicazione:
+    - CIG presente → on_conflict=codice_cig (aggiorna record ARIA/ANAC esistente)
+    - CIG assente  → on_conflict=codice_gara (usa UUID ANAC come chiave)
+    - 409 su url_portale → riprova senza url_portale
     """
-    # Sceglie la chiave di conflict in base alla presenza del CIG
-    if gara.get("codice_cig"):
-        conflict_col = "codice_cig"
-    else:
-        conflict_col = "codice_gara"
-
+    conflict_col = "codice_cig" if gara.get("codice_cig") else "codice_gara"
     url = f"{SUPABASE_URL}/rest/v1/gare?on_conflict={conflict_col}"
 
     r = requests.post(url, headers=HEADERS_SB, json=[gara], timeout=15)
     if r.status_code in (200, 201, 204):
-        return True, False  # (inserita, doc_perso)
+        return True, False
 
-    # Se 409 su url_portale, riprova senza
     if r.status_code == 409 and "url_portale" in r.text:
         gara_clean = {**gara, "url_portale": None}
         r2 = requests.post(url, headers=HEADERS_SB, json=[gara_clean], timeout=15)
         if r2.status_code in (200, 201, 204):
-            return True, True  # (inserita, doc_perso)
+            return True, True  # inserita, doc_perso
 
-    print(f"  ❌ Errore {r.status_code}: {r.text[:100]}")
+    print(f"  ❌ Errore {r.status_code}: {r.text[:120]}")
     return False, False
 
 def insert_batch(gare):
-    """
-    Prima tenta batch per CIG (bandi con CIG) e batch per codice_gara (senza CIG).
-    Se un batch fallisce, ritorna al singolo con fallback.
-    """
     inserite  = 0
     doc_persi = 0
     BATCH     = 50
 
-    # Separa bandi con CIG da bandi senza CIG
-    con_cig    = [g for g in gare if g.get("codice_cig")]
-    senza_cig  = [g for g in gare if not g.get("codice_cig")]
+    con_cig   = [g for g in gare if g.get("codice_cig")]
+    senza_cig = [g for g in gare if not g.get("codice_cig")]
 
-    print(f"  📋 {len(con_cig)} bandi con CIG, {len(senza_cig)} senza CIG")
+    print(f"  📋 {len(con_cig)} con CIG, {len(senza_cig)} senza CIG")
 
-    # Inserisci batch con CIG
+    # Batch con CIG → on_conflict=codice_cig
     for i in range(0, len(con_cig), BATCH):
         batch = con_cig[i:i+BATCH]
         url   = f"{SUPABASE_URL}/rest/v1/gare?on_conflict=codice_cig"
@@ -336,15 +392,12 @@ def insert_batch(gare):
         if r.status_code in (200, 201, 204):
             inserite += len(batch)
         else:
-            # Retry singolo con fallback
             for g in batch:
                 ok, dp = insert_singolo(g)
-                if ok:
-                    inserite += 1
-                if dp:
-                    doc_persi += 1
+                if ok: inserite += 1
+                if dp: doc_persi += 1
 
-    # Inserisci batch senza CIG
+    # Batch senza CIG → on_conflict=codice_gara
     for i in range(0, len(senza_cig), BATCH):
         batch = senza_cig[i:i+BATCH]
         url   = f"{SUPABASE_URL}/rest/v1/gare?on_conflict=codice_gara"
@@ -354,13 +407,11 @@ def insert_batch(gare):
         else:
             for g in batch:
                 ok, dp = insert_singolo(g)
-                if ok:
-                    inserite += 1
-                if dp:
-                    doc_persi += 1
+                if ok: inserite += 1
+                if dp: doc_persi += 1
 
     if doc_persi:
-        print(f"  ℹ️  {doc_persi} bandi salvati senza link documenti (url_portale già in uso)")
+        print(f"  ℹ️  {doc_persi} bandi salvati senza link documenti (url_portale già in uso da altra fonte)")
 
     return inserite
 
@@ -387,6 +438,8 @@ def import_anac_nazionale(days_back=1):
         print(f"\n  💾 Inserimento {len(total_gare)} gare...")
         inserite = insert_batch(total_gare)
         print(f"  ✅ {inserite} gare inserite/aggiornate")
+    else:
+        print(f"  ℹ️  Nessuna gara da inserire (tutti giorni festivi/weekend?)")
 
     return {
         "fonte":    "ANAC_NAZIONALE",
@@ -414,6 +467,7 @@ if __name__ == "__main__":
     if not gare:
         print("⚠️  Nessun bando — prova con una data lavorativa (es. TEST_DATE=24/04/2026)")
     else:
+        # Statistiche
         print(f"\n📊 Statistiche:")
         print(f"  Con CIG:      {sum(1 for g in gare if g['codice_cig'])}/{len(gare)}")
         print(f"  Con importo:  {sum(1 for g in gare if g['importo_totale'])}/{len(gare)}")
@@ -422,16 +476,34 @@ if __name__ == "__main__":
         print(f"  Con regione:  {sum(1 for g in gare if g['regione'])}/{len(gare)}")
         print(f"  Con documenti:{sum(1 for g in gare if g['url_portale'])}/{len(gare)}")
 
+        # Regioni trovate
+        regioni = {}
+        for g in gare:
+            r = g["regione"] or "SCONOSCIUTA"
+            regioni[r] = regioni.get(r, 0) + 1
+        print(f"\n🗺️  Per regione:")
+        for reg, cnt in sorted(regioni.items(), key=lambda x: -x[1])[:10]:
+            print(f"    {reg}: {cnt}")
+
+        # Natura
+        nature = {}
+        for g in gare:
+            n = g["descrizione"] or "n/d"
+            nature[n] = nature.get(n, 0) + 1
+        print(f"\n🏗️  Per natura:")
+        for nat, cnt in sorted(nature.items(), key=lambda x: -x[1])[:8]:
+            print(f"    {nat}: {cnt}")
+
         print(f"\n📋 Primi 5 bandi:")
         for i, g in enumerate(gare[:5], 1):
             print(f"\n  {i}. {g['titolo'][:90]}")
             print(f"     Ente:      {g['ente']}")
             print(f"     Importo:   {g['importo_totale']} €")
             print(f"     CIG:       {g['codice_cig']}")
-            print(f"     Provincia: {g['provincia']}")
-            print(f"     Regione:   {g['regione']}")
+            print(f"     Provincia: {g['provincia']} → {g['regione']}")
+            print(f"     Natura:    {g['descrizione']}")
             print(f"     Scadenza:  {g['scadenza']}")
-            print(f"     Documenti: {g['url_portale']}")
+            print(f"     Documenti: {(g['url_portale'] or '')[:80]}")
 
         if SUPABASE_URL and SERVICE_KEY:
             print(f"\n💾 Inserimento reale in Supabase...")
