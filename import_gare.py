@@ -1,6 +1,13 @@
 """
 import_gare.py — Gare Intelligence FINAL
 Fonti: ANAC (daily delta + monthly ZIP) + TED EU + ARIA Lombardia
+
+Fix 2026-04-26:
+- insert_batch accetta parametro on_conflict per specificare la colonna
+  di deduplicazione nell'URL (?on_conflict=colonna)
+- ARIA usa on_conflict=codice_gara
+- TED usa on_conflict=url_portale (vecchie righe hanno codice_gara=null)
+- ANAC usa on_conflict=codice_cig
 """
 import os, io, csv, json, zipfile, requests, base64
 from datetime import datetime, date, timezone
@@ -122,33 +129,36 @@ def parse_importo(val):
     except: return 0
 
 # ── Insert Supabase ───────────────────────────────────────────────────────────
-def insert_batch(gare, fonte=""):
+def insert_batch(gare, fonte="", on_conflict="codice_gara"):
+    """
+    FIX: aggiunge ?on_conflict=colonna all'URL per dire a Supabase
+    quale colonna usare per la deduplicazione (upsert).
+    Senza questo parametro, merge-duplicates non sa su quale colonna
+    fare il DO UPDATE e ritorna 409.
+    """
     inserite = 0
     errori   = 0
+    url = f"{SUPABASE_URL}/rest/v1/gare?on_conflict={on_conflict}"
+
     for i in range(0, len(gare), BATCH_SIZE):
         batch = gare[i:i+BATCH_SIZE]
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
-            headers=HEADERS_SB, json=batch, timeout=30)
+        r = requests.post(url, headers=HEADERS_SB, json=batch, timeout=30)
         if r.status_code in (200, 201, 204):
             inserite += len(batch)
         else:
-            # DEBUG: stampa il codice e il messaggio di errore completo
-            print(f"  ⚠️  [{fonte}] Batch {i//BATCH_SIZE+1} errore HTTP {r.status_code}")
-            print(f"      Risposta Supabase: {r.text[:500]}")
-            # Retry gara per gara per isolare il problema
-            for j, gara in enumerate(batch):
-                r2 = requests.post(f"{SUPABASE_URL}/rest/v1/gare",
-                    headers=HEADERS_SB, json=[gara], timeout=15)
+            print(f"  ⚠️  [{fonte}] Batch {i//BATCH_SIZE+1} errore HTTP {r.status_code}: {r.text[:200]}")
+            # Retry gara per gara
+            for gara in batch:
+                r2 = requests.post(url, headers=HEADERS_SB, json=[gara], timeout=15)
                 if r2.status_code in (200, 201, 204):
                     inserite += 1
                 else:
                     errori += 1
-                    # Stampa solo il primo errore singolo per non spammare il log
                     if errori == 1:
-                        print(f"      Primo errore singolo HTTP {r2.status_code}: {r2.text[:300]}")
-                        print(f"      Gara incriminata: {json.dumps(gara, ensure_ascii=False)[:300]}")
+                        print(f"      Primo errore singolo {r2.status_code}: {r2.text[:200]}")
+
     if errori > 0:
-        print(f"  ❌ [{fonte}] {errori} gare non inserite per errore Supabase")
+        print(f"  ❌ [{fonte}] {errori} gare non inserite")
     return inserite
 
 # ── ANAC: mappa riga CSV ──────────────────────────────────────────────────────
@@ -227,7 +237,7 @@ def import_anac_daily():
     print(f"  ✅ CSV delta: {len(r.content)/1e3:.0f} KB")
     righe, gare, stati = processa_csv(r.content)
     print(f"  📊 {righe} righe → {len(gare)} attive/in_scadenza: {stati}")
-    inserite = insert_batch(gare, "ANAC")
+    inserite = insert_batch(gare, "ANAC", on_conflict="codice_cig")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ANAC_DELTA","righe":righe,"filtrate":len(gare),"inserite":inserite}
 
@@ -248,7 +258,7 @@ def import_anac_monthly():
             raw = f.read()
     righe, gare, stati = processa_csv(raw)
     print(f"  📊 {righe} righe → {len(gare)} attive/in_scadenza: {stati}")
-    inserite = insert_batch(gare, "ANAC")
+    inserite = insert_batch(gare, "ANAC", on_conflict="codice_cig")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ANAC_ZIP","url":anac_url,"righe":righe,"filtrate":len(gare),"inserite":inserite}
 
@@ -334,7 +344,9 @@ def import_ted():
             break
 
     print(f"  📊 {len(gare)} gare attive/in_scadenza su {pagina-1} pagine")
-    inserite = insert_batch(gare, "TED")
+    # TED usa url_portale come conflict perché le vecchie righe hanno codice_gara=null
+    # ma url_portale impostato — così aggiorna quelle righe invece di creare duplicati
+    inserite = insert_batch(gare, "TED", on_conflict="url_portale")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"TED_EU","totale":totale,"pagine":pagina-1,"filtrate":len(gare),"inserite":inserite}
 
@@ -465,7 +477,7 @@ def import_aria_lombardia():
             break
 
     print(f"  📊 {len(gare)} bandi da inserire")
-    inserite = insert_batch(gare, "ARIA")
+    inserite = insert_batch(gare, "ARIA", on_conflict="codice_gara")
     print(f"  ✅ {inserite} nuove gare inserite")
     return {"fonte":"ARIA_LOMBARDIA","totale":totale,"filtrate":len(gare),"inserite":inserite}
 
