@@ -1,17 +1,18 @@
 """
-test_fonti_v3.py — Round 3: dettaglio Campania + SATER senza filtri
+test_campania.py — Parser completo Portale Gare Campania
+Simula l'importazione senza inserire nulla in Supabase.
+Stampa le gare che verrebbero inserite.
 
-Risultati round 2:
-- Campania: HTML con gare reali (7 righe tabella, titoli visibili)
-  → apriamo un link dettaglio per trovare importo/scadenza
-- SATER: JSON API funziona ma review_state=published dà 1 solo bando 2013
-  → proviamo senza filtro stato, con paginazione, e altri tipi
-
-NON inserisce dati.
+Risultati round 3:
+- Struttura HTML chiara: titolo, ente, importo, scadenza tutto nella lista
+- scadenzaBando è già nell'URL del link dettaglio
+- Importo è nella tabella (es. 29.966.429,63€)
+- codice_gara = ID nel parametro bando=ID
 """
 
-import requests, json, re, xml.etree.ElementTree as ET
-from datetime import datetime
+import requests, re, json, html
+from datetime import datetime, date
+from urllib.parse import urlencode, urlparse, parse_qs
 
 TIMEOUT = 20
 HEADERS = {
@@ -19,180 +20,219 @@ HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9",
 }
 
-def get(url, accept=None, json_accept=False):
-    h = dict(HEADERS)
-    if json_accept:
-        h["Accept"] = "application/json"
-    elif accept:
-        h["Accept"] = accept
-    try:
-        r = requests.get(url, headers=h, timeout=TIMEOUT)
-        return r
-    except Exception as e:
-        print(f"   ❌ Eccezione: {e}")
-        return None
-
-def sep(titolo):
-    print(f"\n{'='*60}")
-    print(f"🔍 {titolo}")
+BASE_URL = "https://pgt.regione.campania.it"
 
 def strip_html(s):
     s = re.sub(r'<[^>]+>', ' ', s or '')
-    s = re.sub(r'&[a-z]+;', ' ', s)
+    s = html.unescape(s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-# ─────────────────────────────────────────────────────────────
-# CAMPANIA — apri i link dettaglio trovati nell'HTML
-# ─────────────────────────────────────────────────────────────
+def parse_importo(s):
+    """Converte '29.966.429,63€' in float"""
+    s = (s or "").replace("€","").replace(" ","").strip()
+    s = s.replace(".","").replace(",",".")
+    try:
+        return float(s)
+    except:
+        return None
 
-sep("CAMPANIA — Struttura lista bandi (parsing righe)")
-r = get("https://pgt.regione.campania.it/portalegare/index.php/bandi?scaduti=no&tipobando=")
-if r and r.status_code == 200:
-    html = r.text
+def parse_scadenza(s):
+    """Converte '2026-05-07T13:00:00' in ISO"""
+    if not s:
+        return None
+    s = s.strip()
+    if "T" in s:
+        return s + "+00:00" if "+" not in s else s
+    return None
 
-    # Cerca i link ai dettagli delle singole gare
-    # I link tipici sono /portalegare/index.php/bandi/dettaglio/ID
-    links_det = re.findall(
-        r'href=["\']([^"\']*(?:dettaglio|view|bando/\d+|gara/\d+)[^"\']*)["\']',
-        html, re.IGNORECASE
+def parse_gare_da_html(html_text, pagina=1):
+    """
+    Parsea la tabella bandi dalla pagina HTML del portale Campania.
+    Struttura tabella:
+    <tr>
+      <td>TITOLO</td>
+      <td>TIPO (Bando/Avviso)</td>
+      <td>ENTE</td>
+      <td>STAZIONE APPALTANTE</td>
+      <td>IMPORTO€</td>
+      <td>link DETTAGLIO</td>
+    </tr>
+    """
+    gare = []
+
+    # Estrai tutte le righe <tr> con link getdettaglio
+    # Il link dettaglio contiene bando=ID e scadenzaBando=DATA
+    pattern_riga = re.compile(
+        r'<tr[^>]*>(.*?)</tr>',
+        re.DOTALL | re.IGNORECASE
     )
-    print(f"   Link dettaglio trovati: {len(links_det)}")
-    print(f"   Esempi: {links_det[:5]}")
+    pattern_link = re.compile(
+        r'href=["\']([^"\']*getdettaglio=yes[^"\']*)["\']',
+        re.IGNORECASE
+    )
 
-    # Cerca anche link con pattern /bandi/NNN
-    links_num = re.findall(r'href=["\']([^"\']*\/bandi\/\d+[^"\']*)["\']', html)
-    print(f"   Link /bandi/NNN: {len(links_num)} — {links_num[:3]}")
+    for match in pattern_riga.finditer(html_text):
+        riga = match.group(1)
 
-    # Cerca ID numerici nei link
-    ids = re.findall(r'/bandi[/_](\d+)', html)
-    print(f"   ID numerici trovati: {ids[:10]}")
+        # La riga deve contenere un link dettaglio
+        link_match = pattern_link.search(riga)
+        if not link_match:
+            continue
 
-    # Stampa HTML grezzo della sezione bandi (500 chars intorno a "Proc")
-    idx = html.find("Proc")
-    if idx > 0:
-        print(f"\n   HTML intorno a 'Proc' (chars {idx-100}:{idx+800}):")
-        print(html[max(0,idx-100):idx+800])
+        link_rel = link_match.group(1)
+        link_rel = html.unescape(link_rel)
+        link_full = BASE_URL + link_rel if link_rel.startswith("/") else link_rel
 
-sep("CAMPANIA — Prova URL dettaglio gara")
-# Prova diversi pattern di URL per il dettaglio
-for url in [
-    "https://pgt.regione.campania.it/portalegare/index.php/bandi/dettaglio/4297",
-    "https://pgt.regione.campania.it/portalegare/index.php/bandi?id=4297",
-    "https://pgt.regione.campania.it/portalegare/index.php/component/content/article/4297",
-]:
-    r = get(url)
-    if r:
-        print(f"\n   {url}")
-        print(f"   HTTP: {r.status_code}, Size: {len(r.content)/1024:.1f} KB")
-        if r.status_code == 200:
-            html = r.text
-            # Cerca importo
-            importi = re.findall(r'(?:importo|base d.asta|valore|€)\s*[:\s]*([€\d.,\s]{4,20})', html, re.IGNORECASE)
-            # Cerca scadenza
-            scadenze = re.findall(r'(?:scadenza|termine|entro il|data)\s*[:\s]*(\d{1,2}[/\-]\d{1,2}[/\-]\d{4}|\d{4}[/\-]\d{2}[/\-]\d{2})', html, re.IGNORECASE)
-            print(f"   Importi trovati: {importi[:3]}")
-            print(f"   Scadenze trovate: {scadenze[:3]}")
-            # Stampa testo grezzo intorno a parole chiave
-            for kw in ["importo", "scadenz", "oggetto", "Proc"]:
-                idx = html.lower().find(kw.lower())
-                if idx > 0:
-                    print(f"   Contesto '{kw}': ...{strip_html(html[idx:idx+200])}...")
+        # Estrai parametri dall'URL
+        parsed = parse_qs(link_rel.split("?",1)[-1])
+        codice_gara = parsed.get("bando", [None])[0]
+        scadenza_raw = parsed.get("scadenzaBando", [None])[0]
+        tipo_bando   = parsed.get("tipobando", ["Bando"])[0]
+
+        # Estrai celle <td>
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', riga, re.DOTALL | re.IGNORECASE)
+        celle = [strip_html(td) for td in tds]
+        celle = [c for c in celle if c]  # rimuovi celle vuote
+
+        if len(celle) < 2:
+            continue
+
+        # Struttura celle: titolo | tipo | ente | stazione | importo | [dettaglio]
+        titolo   = celle[0] if len(celle) > 0 else "(n/d)"
+        ente     = celle[2] if len(celle) > 2 else (celle[1] if len(celle) > 1 else None)
+        # Cerca importo: cella con € o formato numerico
+        importo_val = None
+        for cella in celle:
+            if "€" in cella or re.search(r'\d{1,3}(?:\.\d{3})*,\d{2}', cella):
+                importo_val = parse_importo(re.sub(r'[^\d.,€]','', cella))
+                if importo_val and importo_val > 0:
                     break
 
-# ─────────────────────────────────────────────────────────────
-# SATER — prova senza filtro review_state, altri tipi
-# ─────────────────────────────────────────────────────────────
+        scadenza_iso = parse_scadenza(scadenza_raw)
 
-sep("SATER — API senza filtro review_state (tutti i bandi)")
-r = get(
-    "https://intercenter.regione.emilia-romagna.it/@search?portal_type=Bando&b_size=10&sort_on=Date&sort_order=descending",
-    json_accept=True
-)
-if r:
-    print(f"   HTTP: {r.status_code}")
-    if r.status_code == 200:
-        try:
-            d = r.json()
-            print(f"   items_total: {d.get('items_total', '?')}")
-            items = d.get("items", [])
-            print(f"   Items ricevuti: {len(items)}")
-            for it in items[:5]:
-                print(f"     - [{it.get('Date','?')[:10]}] {it.get('title', it.get('@id','?'))[:80]}")
-                print(f"       URL: {it.get('@id','')}")
-        except Exception as e:
-            print(f"   JSON error: {e} — Raw: {r.text[:200]}")
+        # Stato da scadenza
+        stato = "attiva"
+        if scadenza_raw:
+            try:
+                scad_d = datetime.fromisoformat(scadenza_raw[:10]).date()
+                diff = (scad_d - date.today()).days
+                if diff < 0:
+                    stato = "scaduta"
+                elif diff <= 7:
+                    stato = "in_scadenza"
+            except:
+                pass
 
-sep("SATER — API con tipo 'Procedura' o 'Gara'")
-for tipo in ["Procedura", "Gara", "Notice", "Avviso"]:
-    r = get(
-        f"https://intercenter.regione.emilia-romagna.it/@search?portal_type={tipo}&b_size=3",
-        json_accept=True
-    )
-    if r and r.status_code == 200:
-        try:
-            d = r.json()
-            tot = d.get("items_total", 0)
-            print(f"   portal_type={tipo}: {tot} risultati")
-            if tot > 0:
-                for it in d.get("items", [])[:2]:
-                    print(f"     - {it.get('title', it.get('@id',''))[:80]}")
-        except: pass
+        gara = {
+            "codice_cig":   None,
+            "titolo":       titolo[:500],
+            "descrizione":  None,
+            "riassunto_ai": None,
+            "keywords_ai":  [],
+            "settore_ai":   None,
+            "ente":         ente,
+            "regione":      "CAMPANIA",
+            "provincia":    None,
+            "comune":       None,
+            "categoria_cpv":   None,
+            "categoria_label": tipo_bando,
+            "procedura":    tipo_bando,
+            "criterio_aggiudicazione": None,
+            "importo_min":  None,
+            "importo_max":  None,
+            "importo_totale": round(importo_val, 2) if importo_val else None,
+            "scadenza":     scadenza_iso,
+            "data_pubblicazione": None,
+            "stato":        stato,
+            "fonte":        "CAMPANIA",
+            "url_bando":    link_full,
+            "url_portale":  link_full,
+            "id_sintel":    None,
+            "codice_gara":  codice_gara,
+            "rup":          None,
+        }
+        gare.append(gara)
 
-sep("SATER — Apri un bando da API e leggi il dettaglio")
-# Prima prendo la lista, poi apro il primo item
-r = get(
-    "https://intercenter.regione.emilia-romagna.it/@search?portal_type=Bando&b_size=5&sort_on=Date&sort_order=descending",
-    json_accept=True
-)
-if r and r.status_code == 200:
+    return gare
+
+def scarica_pagina(url):
     try:
-        d = r.json()
-        items = d.get("items", [])
-        print(f"   Totale bandi: {d.get('items_total','?')}, ricevuti: {len(items)}")
-        for it in items[:3]:
-            url_det = it.get("@id","")
-            print(f"\n   Apro dettaglio: {url_det}")
-            rd = get(url_det, json_accept=True)
-            if rd and rd.status_code == 200:
-                try:
-                    det = rd.json()
-                    print(f"   Keys: {list(det.keys())[:15]}")
-                    # Cerca campi importo e scadenza
-                    for campo in ["title","description","scadenza","importo","text","effective","expires","subjects","start","end"]:
-                        v = det.get(campo)
-                        if v:
-                            print(f"   {campo}: {str(v)[:150]}")
-                except:
-                    # Prova HTML
-                    html = rd.text
-                    importi = re.findall(r'(?:importo|base d.asta|valore)[^€\d]*([€\d.,]{5,20})', html, re.IGNORECASE)
-                    scadenze = re.findall(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{4}', html)
-                    print(f"   HTML — importi: {importi[:2]}, scadenze: {scadenze[:3]}")
-            break  # solo il primo per ora
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            return r.text
+        print(f"   HTTP {r.status_code}")
+        return None
     except Exception as e:
-        print(f"   Errore: {e}")
+        print(f"   Eccezione: {e}")
+        return None
 
-sep("SATER — Prova paginazione API (batch 10, pagina 2)")
-r = get(
-    "https://intercenter.regione.emilia-romagna.it/@search?portal_type=Bando&b_size=10&b_start=0",
-    json_accept=True
+# ─── Main ──────────────────────────────────────────────────────────────────────
+print(f"🚀 Test Campania Parser — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+print("NON inserisce dati — solo simulazione\n")
+
+# 1. Scarica lista bandi non scaduti
+url_lista = "https://pgt.regione.campania.it/portalegare/index.php/bandi?scaduti=no&tipobando="
+print(f"📥 Scarico lista bandi: {url_lista}")
+html_text = scarica_pagina(url_lista)
+
+if not html_text:
+    print("❌ Impossibile scaricare la pagina")
+    exit(1)
+
+print(f"✅ HTML scaricato: {len(html_text)/1024:.1f} KB")
+
+# 2. Parsa le gare
+gare = parse_gare_da_html(html_text)
+print(f"✅ Gare parsate: {len(gare)}\n")
+
+# 3. Mostra le gare trovate
+for i, g in enumerate(gare, 1):
+    print(f"{'─'*50}")
+    print(f"Gara #{i}")
+    print(f"  Titolo:   {g['titolo'][:100]}")
+    print(f"  Ente:     {g['ente']}")
+    print(f"  Importo:  {g['importo_totale']} €")
+    print(f"  Scadenza: {g['scadenza']}")
+    print(f"  Stato:    {g['stato']}")
+    print(f"  ID gara:  {g['codice_gara']}")
+    print(f"  URL:      {g['url_bando'][:80]}...")
+
+# 4. Prova paginazione — cerca link "pagina successiva"
+print(f"\n{'='*50}")
+print("🔍 Controllo paginazione...")
+# Cerca pattern tipici di paginazione
+pag_links = re.findall(
+    r'href=["\']([^"\']*(?:pagina|page|start|offset|p=)\d+[^"\']*)["\']',
+    html_text, re.IGNORECASE
 )
-if r and r.status_code == 200:
-    try:
-        d = r.json()
-        print(f"   Totale: {d.get('items_total','?')}")
-        print(f"   Batches disponibili: {d.get('batching', {})}")
-        # Prova b_start=10
-        r2 = get(
-            "https://intercenter.regione.emilia-romagna.it/@search?portal_type=Bando&b_size=10&b_start=10",
-            json_accept=True
-        )
-        if r2 and r2.status_code == 200:
-            d2 = r2.json()
-            print(f"   Pagina 2 items: {len(d2.get('items',[]))}")
-    except Exception as e:
-        print(f"   Errore: {e}")
+next_links = re.findall(
+    r'href=["\']([^"\']+)["\'][^>]*>[^<]*(?:success|next|avanti|›|»)[^<]*<',
+    html_text, re.IGNORECASE
+)
+print(f"Link paginazione trovati: {len(pag_links)}")
+print(f"Link 'successiva' trovati: {len(next_links)}")
 
-print(f"\n{'='*60}")
-print("✅ Test v3 completato")
+# Cerca anche link numerici di pagina
+page_nums = re.findall(r'href=["\']([^"\']*bandi[^"\']*)["\'][^>]*>\s*(\d+)\s*<', html_text)
+if page_nums:
+    print(f"Link pagine numerate: {page_nums[:5]}")
+
+# Stampa sezione paginazione dall'HTML
+idx_pag = html_text.lower().find("pagination")
+if idx_pag < 0:
+    idx_pag = html_text.lower().find("pagina")
+if idx_pag > 0:
+    print(f"\nHTML sezione paginazione:\n{strip_html(html_text[idx_pag:idx_pag+300])}")
+
+# 5. Riepilogo finale
+print(f"\n{'='*50}")
+print(f"✅ RIEPILOGO:")
+print(f"   Gare trovate:    {len(gare)}")
+print(f"   Con importo:     {sum(1 for g in gare if g['importo_totale'])}")
+print(f"   Con scadenza:    {sum(1 for g in gare if g['scadenza'])}")
+print(f"   Stato attiva:    {sum(1 for g in gare if g['stato']=='attiva')}")
+print(f"   Stato scaduta:   {sum(1 for g in gare if g['stato']=='scaduta')}")
+print(f"\nJSON pronto per Supabase (prima gara):")
+if gare:
+    print(json.dumps(gare[0], indent=2, ensure_ascii=False))
